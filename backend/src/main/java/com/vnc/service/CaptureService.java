@@ -34,7 +34,7 @@ public class CaptureService implements SmartLifecycle {
     private static final float FULL_FRAME_THRESHOLD = 0.4f;
     private static final float JPEG_QUALITY = 0.6f;
     private static final long CAPTURE_INTERVAL_MS = 33;
-    private static final int FORCE_FULL_INTERVAL = 60;
+    private static final int FORCE_FULL_INTERVAL = 300;
 
     private final SwingApp swingApp;
     private final BroadcastService broadcastService;

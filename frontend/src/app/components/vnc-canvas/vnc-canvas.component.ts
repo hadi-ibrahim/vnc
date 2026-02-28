@@ -38,6 +38,8 @@ import { VncService, FrameMessage } from '../../services/vnc.service';
 export class VncCanvasComponent implements OnInit, AfterViewInit, OnDestroy {
   @ViewChild('canvas') canvasRef!: ElementRef<HTMLCanvasElement>;
   private ctx!: CanvasRenderingContext2D;
+  private offscreen!: HTMLCanvasElement;
+  private offCtx!: CanvasRenderingContext2D;
   private readonly TILE_SIZE = 32;
 
   constructor(private vncService: VncService) {}
@@ -52,6 +54,11 @@ export class VncCanvasComponent implements OnInit, AfterViewInit, OnDestroy {
     this.ctx = ctx;
     this.ctx.fillStyle = '#111';
     this.ctx.fillRect(0, 0, 1280, 720);
+
+    this.offscreen = document.createElement('canvas');
+    this.offscreen.width = 1280;
+    this.offscreen.height = 720;
+    this.offCtx = this.offscreen.getContext('2d')!;
   }
 
   ngOnDestroy(): void {
@@ -61,13 +68,48 @@ export class VncCanvasComponent implements OnInit, AfterViewInit, OnDestroy {
   private renderFrame(msg: FrameMessage): void {
     if (!this.ctx) return;
 
+    if (msg.full) {
+      this.renderFullFrame(msg);
+    } else {
+      this.renderDiffFrame(msg);
+    }
+  }
+
+  private renderDiffFrame(msg: FrameMessage): void {
     for (const tile of msg.tiles) {
-      const img = new Image();
       const dx = tile.x * this.TILE_SIZE;
       const dy = tile.y * this.TILE_SIZE;
-      img.onload = () => this.ctx.drawImage(img, dx, dy);
-      img.src = 'data:image/jpeg;base64,' + tile.data;
+      this.decodeTile(tile.data).then(bitmap => {
+        this.ctx.drawImage(bitmap, dx, dy);
+        bitmap.close();
+      });
     }
+  }
+
+  private renderFullFrame(msg: FrameMessage): void {
+    this.offCtx.drawImage(this.canvasRef.nativeElement, 0, 0);
+
+    const draws = msg.tiles.map(tile => {
+      const dx = tile.x * this.TILE_SIZE;
+      const dy = tile.y * this.TILE_SIZE;
+      return this.decodeTile(tile.data).then(bitmap => {
+        this.offCtx.drawImage(bitmap, dx, dy);
+        bitmap.close();
+      });
+    });
+
+    Promise.all(draws).then(() => {
+      this.ctx.drawImage(this.offscreen, 0, 0);
+    });
+  }
+
+  private decodeTile(base64: string): Promise<ImageBitmap> {
+    const binStr = atob(base64);
+    const bytes = new Uint8Array(binStr.length);
+    for (let i = 0; i < binStr.length; i++) {
+      bytes[i] = binStr.charCodeAt(i);
+    }
+    return createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
   }
 
   onClick(event: MouseEvent): void {
