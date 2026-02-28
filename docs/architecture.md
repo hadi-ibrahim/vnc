@@ -8,41 +8,46 @@
 │                                                     │
 │  ┌──────────┐     ┌────────────────┐                │
 │  │ SwingApp │────▶│ AnimatedPanel  │  (EDT, 60 FPS) │
-│  │ (JFrame) │     │ LoadingPanel   │                │
-│  │ CardLayout│     └────────────────┘                │
+│  │ (JFrame) │     └────────────────┘                │
 │  └────┬─────┘                                       │
 │       │ paint(g)                                    │
 │       ▼                                             │
-│  ┌──────────────┐    ┌──────────────────┐           │
-│  │CaptureService│───▶│ BroadcastService │           │
-│  │ (30 FPS loop)│    │ (virtual threads)│           │
-│  └──────────────┘    └───────┬──────────┘           │
-│       │                      │                      │
-│       │ tile diff + JPEG     │ binary WSS frames    │
-│       │ (TurboJPEG/ImageIO)  │ (+ text for lock)   │
-│       │                      ▼                      │
-│  ┌────────────────┐  ┌──────────────────┐           │
-│  │RemoteControl   │  │VncWebSocketHandler│◀── WSS   │
-│  │Service         │  │  (routes msgs)   │           │
-│  └────────────────┘  └──────────────────┘           │
-│       ▲                      │                      │
-│       │ click/key            │ lock/unlock           │
-│       │                      ▼                      │
-│       │              ┌──────────────────┐           │
-│       └──────────────│ControlLockService│           │
-│                      │ (AtomicReference)│           │
-│                      └──────────────────┘           │
+│  ┌──────────────┐    ┌────────────────────┐         │
+│  │CaptureService│───▶│ H264EncoderService │         │
+│  │ (20 FPS loop)│    │ (JavaCV/FFmpeg)    │         │
+│  └──────────────┘    └────────┬───────────┘         │
+│                               │                     │
+│                               │ encoded H.264 bytes │
+│                               ▼                     │
+│                       ┌──────────────────┐          │
+│                       │ BroadcastService │          │
+│                       │ (virtual threads)│          │
+│                       └───────┬──────────┘          │
+│                               │                     │
+│                  binary WSS frames (+ text for lock)│
+│                               │                     │
+│  ┌────────────────┐   ┌──────────────────┐          │
+│  │RemoteControl   │   │VncWebSocketHandler│◀── WSS  │
+│  │Service         │   │  (routes msgs)   │          │
+│  └────────────────┘   └──────────────────┘          │
+│       ▲                       │                     │
+│       │ click/key             │ lock/unlock          │
+│       │                       ▼                     │
+│       │               ┌──────────────────┐          │
+│       └───────────────│ControlLockService│          │
+│                       │ (AtomicReference)│          │
+│                       └──────────────────┘          │
 └─────────────────────────────────────────────────────┘
-         │ WSS (binary frames + text JSON)
+         │ WSS (binary H.264 frames + text JSON)
          ▼
 ┌─────────────────────────────────────────────────────┐
 │              Browser (Angular 19)                    │
 │                                                     │
 │  ┌──────────┐    ┌───────────────────┐              │
 │  │VncService│───▶│VncCanvasComponent │              │
-│  │(WebSocket│    │(Canvas 1280x720)  │              │
-│  │ binary + │    │ tile renderer     │              │
-│  │ signals) │    │ double-buffered   │              │
+│  │(WebSocket│    │(Canvas 1280×720)  │              │
+│  │ binary + │    │ WebCodecs         │              │
+│  │ signals) │    │ VideoDecoder      │              │
 │  └──────────┘    └───────────────────┘              │
 └─────────────────────────────────────────────────────┘
 ```
@@ -54,24 +59,23 @@
 | Component              | Responsibility                                         |
 |------------------------|--------------------------------------------------------|
 | `VncApplication`       | Entry point. Disables AWT headless mode for Swing.     |
-| `SwingApp`             | SmartLifecycle (phase 0). Creates JFrame on EDT with CardLayout for page switching. |
+| `SwingApp`             | SmartLifecycle (phase 0). Creates JFrame on EDT.       |
 | `AnimatedPanel`        | 60 FPS Swing Timer animation with bouncing balls.      |
-| `LoadingPanel`         | Spinning arc loader animation with "Loading..." label. |
-| `CaptureService`       | SmartLifecycle (phase 1). 30 FPS scheduled capture, tile diffing, JPEG encoding, binary frame assembly. |
-| `BroadcastService`     | Client session registry. Sends binary frames for screen data, JSON text for lock status, via virtual threads. |
+| `H264EncoderService`   | Wraps FFmpeg's H.264 encoder (libx264 or libopenh264) via JavaCV. Handles RGB→YUV420P conversion, Annex B→AVCC format conversion. |
+| `CaptureService`       | SmartLifecycle (phase 1). 20 FPS scheduled capture, feeds frames to H264Encoder. |
+| `BroadcastService`     | Client session registry. Sends binary H.264 frames + codec config, JSON text for lock status, via virtual threads. |
 | `ControlLockService`   | Single-controller lock via CAS on AtomicReference.     |
 | `RemoteControlService` | `getSnapshot()`, `click(x,y)`, `press(key)`. EDT-safe. |
 | `VncWebSocketHandler`  | WSS endpoint. Routes incoming text messages, manages connect/disconnect lifecycle. |
 | `WebSocketConfig`      | Registers `/ws` handler. Sets buffer and timeout limits.|
-| `JpegCodec`            | TurboJPEG native encoder (via JNA) with automatic ImageIO fallback. |
 
 ### Frontend
 
 | Component              | Responsibility                                         |
 |------------------------|--------------------------------------------------------|
 | `AppComponent`         | Top-level layout. Connection status, lock button.      |
-| `VncCanvasComponent`   | Canvas renderer. Tile patching via `createImageBitmap`, double-buffered full frames, click/key forwarding. |
-| `VncService`           | WebSocket lifecycle, binary frame parsing, auto-reconnect, Angular signals for reactive state. |
+| `VncCanvasComponent`   | Canvas renderer. Uses WebCodecs `VideoDecoder` for hardware-accelerated H.264 decoding. Click/key forwarding. |
+| `VncService`           | WebSocket lifecycle, binary H.264 frame parsing, codec config handling, auto-reconnect, Angular signals for reactive state. |
 
 ## Data Flow
 
@@ -81,26 +85,22 @@
 EDT repaint (60 FPS)
     │
     ▼
-CaptureService.captureAndBroadcast() — scheduled every 33ms
+CaptureService.captureAndBroadcast() — scheduled every 50ms (20 FPS)
     │
     ├── SwingUtilities.invokeAndWait()  → paint content pane into BufferedImage
     │
-    ├── Tile diff (32x32 grid, 40 cols × 23 rows = 920 tiles)
-    │   └── Arrays.mismatch() on pre-allocated int[] buffers
+    ├── H264EncoderService.encode(bufferedImage)
+    │   ├── Extract pixel data (DataBufferInt → BGRA ByteBuffer)
+    │   ├── sws_scale: BGRA → YUV420P
+    │   ├── avcodec_send_frame + avcodec_receive_packet
+    │   ├── annexBToAvccPacket: convert NAL units to length-prefixed format
+    │   └── Returns encoded byte[] + isKeyframe flag
     │
-    ├── If >40% changed OR forced interval → full frame (encode all 920 tiles)
-    │   Otherwise → diff frame (encode only changed tiles)
-    │
-    ├── JPEG encode each tile at quality 0.6
-    │   └── TurboJPEG via JNA (or ImageIO fallback) → raw byte[]
-    │
-    ├── buildBinaryFrame() → pack all tiles into compact binary format
-    │   └── [flags][tileCount][col|row|jpegLen|jpegBytes]...
-    │
-    └── BroadcastService.broadcastFrame(byte[], isFull)
+    └── BroadcastService.broadcastFrame(encoded, isKeyframe, timestamp)
         │
+        ├── Build binary frame: [flags:1][timestamp:4][H.264 data:N]
         ├── Wrap in BinaryMessage once (shared across all clients)
-        ├── Cache if full frame (for new client init)
+        ├── Cache if keyframe (for new client init)
         │
         └── For each client:
             ├── AtomicBoolean.compareAndSet(false, true) → if fails, DROP frame
@@ -113,16 +113,21 @@ CaptureService.captureAndBroadcast() — scheduled every 33ms
 ```
 WebSocket binary message (ArrayBuffer)
     │
-    ├── VncService.handleBinaryFrame()
-    │   ├── DataView: read flags, tileCount from header
-    │   └── For each tile: read col, row, jpegLen, slice Uint8Array
+    ├── First byte == 0xFF → Codec config (SPS+PPS in AVCC format)
+    │   └── VncService stores config, VncCanvasComponent configures VideoDecoder
     │
-    ▼
-VncCanvasComponent.renderFrame()
-    │
-    ├── Diff: for each tile → createImageBitmap(Blob) → drawImage()
-    │
-    └── Full: decode all tiles to offscreen canvas → blit atomically
+    └── First byte != 0xFF → H.264 frame
+        ├── VncService parses: flags (keyframe), timestamp, H.264 data
+        │
+        ▼
+    VncCanvasComponent.onH264Frame()
+        │
+        ├── Create EncodedVideoChunk(type: key|delta, timestamp, data)
+        ├── VideoDecoder.decode(chunk)
+        │
+        └── VideoDecoder output callback:
+            ├── ctx.drawImage(videoFrame, 0, 0)
+            └── videoFrame.close()
 ```
 
 ### Control Pipeline (Client → Server)
@@ -170,6 +175,15 @@ Spring `SmartLifecycle` phases control startup order:
 | Phase | Component       | What Happens                                 |
 |-------|-----------------|----------------------------------------------|
 | 0     | `SwingApp`      | `invokeAndWait()` → JFrame created and visible |
-| 1     | `CaptureService`| `scheduleAtFixedRate()` → capture loop starts  |
+| 1     | `CaptureService`| H264Encoder started, `scheduleAtFixedRate()` → capture loop starts |
 
 The 200ms initial delay on the capture scheduler provides additional safety margin after the JFrame becomes visible.
+
+## Bandwidth Comparison
+
+```
+Old (JPEG tiles):   30 KB/frame × 20 FPS = 600 KB/s/client  (20 clients = 12 MB/s)
+New (H.264):        ~2 KB/frame × 20 FPS =  40 KB/s/client  (20 clients = 800 KB/s)
+```
+
+H.264 achieves this through **inter-frame prediction**: delta frames encode only motion vectors and residuals relative to the previous frame, rather than re-encoding each changed region from scratch.

@@ -6,7 +6,7 @@ import {
   OnInit,
   OnDestroy,
 } from '@angular/core';
-import { VncService, FrameMessage } from '../../services/vnc.service';
+import { VncService, H264Frame } from '../../services/vnc.service';
 
 @Component({
   selector: 'app-vnc-canvas',
@@ -38,14 +38,15 @@ import { VncService, FrameMessage } from '../../services/vnc.service';
 export class VncCanvasComponent implements OnInit, AfterViewInit, OnDestroy {
   @ViewChild('canvas') canvasRef!: ElementRef<HTMLCanvasElement>;
   private ctx!: CanvasRenderingContext2D;
-  private offscreen!: HTMLCanvasElement;
-  private offCtx!: CanvasRenderingContext2D;
-  private readonly TILE_SIZE = 32;
+  private decoder: VideoDecoder | null = null;
+  private codecDescription: Uint8Array | null = null;
+  private pendingFrames: H264Frame[] = [];
 
   constructor(private vncService: VncService) {}
 
   ngOnInit(): void {
-    this.vncService.onFrame((msg) => this.renderFrame(msg));
+    this.vncService.onConfig((config) => this.onCodecConfig(config));
+    this.vncService.onFrame((frame) => this.onH264Frame(frame));
   }
 
   ngAfterViewInit(): void {
@@ -54,57 +55,74 @@ export class VncCanvasComponent implements OnInit, AfterViewInit, OnDestroy {
     this.ctx = ctx;
     this.ctx.fillStyle = '#111';
     this.ctx.fillRect(0, 0, 1280, 720);
-
-    this.offscreen = document.createElement('canvas');
-    this.offscreen.width = 1280;
-    this.offscreen.height = 720;
-    this.offCtx = this.offscreen.getContext('2d')!;
   }
 
   ngOnDestroy(): void {
     this.vncService.onFrame(() => {});
-  }
-
-  private renderFrame(msg: FrameMessage): void {
-    if (!this.ctx) return;
-
-    if (msg.full) {
-      this.renderFullFrame(msg);
-    } else {
-      this.renderDiffFrame(msg);
+    this.vncService.onConfig(() => {});
+    if (this.decoder && this.decoder.state !== 'closed') {
+      this.decoder.close();
     }
   }
 
-  private renderDiffFrame(msg: FrameMessage): void {
-    for (const tile of msg.tiles) {
-      const dx = tile.x * this.TILE_SIZE;
-      const dy = tile.y * this.TILE_SIZE;
-      this.decodeTile(tile.jpeg).then(bitmap => {
-        this.ctx.drawImage(bitmap, dx, dy);
-        bitmap.close();
-      });
+  private onCodecConfig(config: Uint8Array): void {
+    this.codecDescription = config;
+    this.initDecoder();
+  }
+
+  private initDecoder(): void {
+    if (this.decoder && this.decoder.state !== 'closed') {
+      this.decoder.close();
     }
-  }
 
-  private renderFullFrame(msg: FrameMessage): void {
-    this.offCtx.drawImage(this.canvasRef.nativeElement, 0, 0);
-
-    const draws = msg.tiles.map(tile => {
-      const dx = tile.x * this.TILE_SIZE;
-      const dy = tile.y * this.TILE_SIZE;
-      return this.decodeTile(tile.jpeg).then(bitmap => {
-        this.offCtx.drawImage(bitmap, dx, dy);
-        bitmap.close();
-      });
+    this.decoder = new VideoDecoder({
+      output: (frame: VideoFrame) => {
+        this.ctx.drawImage(frame, 0, 0);
+        frame.close();
+      },
+      error: (e: DOMException) => {
+        console.error('VideoDecoder error:', e);
+      },
     });
 
-    Promise.all(draws).then(() => {
-      this.ctx.drawImage(this.offscreen, 0, 0);
+    this.decoder.configure({
+      codec: 'avc1.42001e',
+      codedWidth: 1280,
+      codedHeight: 720,
+      description: this.codecDescription!,
     });
+
+    for (const frame of this.pendingFrames) {
+      this.decodeFrame(frame);
+    }
+    this.pendingFrames = [];
   }
 
-  private decodeTile(jpeg: Uint8Array): Promise<ImageBitmap> {
-    return createImageBitmap(new Blob([jpeg], { type: 'image/jpeg' }));
+  private onH264Frame(frame: H264Frame): void {
+    if (!this.decoder || this.decoder.state !== 'configured') {
+      if (frame.keyframe) {
+        this.pendingFrames.push(frame);
+      }
+      return;
+    }
+
+    this.decodeFrame(frame);
+  }
+
+  private decodeFrame(frame: H264Frame): void {
+    if (!this.decoder || this.decoder.state !== 'configured') return;
+
+    const chunk = new EncodedVideoChunk({
+      type: frame.keyframe ? 'key' : 'delta',
+      timestamp: frame.timestamp * 1000,
+      data: frame.data,
+    });
+
+    try {
+      this.decoder.decode(chunk);
+    } catch (e) {
+      console.error('Decode failed:', e);
+    }
   }
 
   onClick(event: MouseEvent): void {

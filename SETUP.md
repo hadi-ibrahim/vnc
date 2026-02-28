@@ -8,12 +8,11 @@
 | Gradle       | 8.10+   | `gradle -v`        | Yes      |
 | Node.js      | 20+     | `node -v`          | Yes      |
 | npm          | 10+     | `npm -v`           | Yes      |
-| libjpeg-turbo| any     | `ls /opt/homebrew/lib/libturbojpeg*` | Optional (recommended) |
 
 ### macOS (Homebrew)
 
 ```bash
-brew install openjdk@21 gradle node jpeg-turbo
+brew install openjdk@21 gradle node
 ```
 
 If `openjdk@21` is keg-only, export it:
@@ -24,25 +23,11 @@ export JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
 
 Add this to `~/.zshrc` to persist across sessions.
 
-### TurboJPEG (optional)
+### FFmpeg / H.264 Encoding
 
-The backend uses **TurboJPEG** (via JNA) for hardware-accelerated JPEG encoding, providing a 2-6x speedup over the default `javax.imageio`. If `libturbojpeg` is not found, the application falls back to ImageIO automatically.
+The backend uses **JavaCV** (bundled FFmpeg natives via `javacv-platform`) for H.264 video encoding. No separate FFmpeg installation is required — the Gradle dependency includes platform-specific native libraries for macOS (ARM + Intel), Linux, and Windows.
 
-```bash
-# macOS
-brew install jpeg-turbo
-
-# Debian/Ubuntu
-sudo apt install libturbojpeg0-dev
-
-# RHEL/Fedora
-sudo dnf install libjpeg-turbo-devel
-```
-
-Check the application logs at startup to confirm:
-```
-INFO  c.v.util.JpegCodec - TurboJPEG native acceleration enabled
-```
+The bundled encoder is **libopenh264** (Cisco's open-source H.264 codec). If `libx264` is available on the system, it will be preferred automatically.
 
 ---
 
@@ -82,6 +67,7 @@ cd backend
 
 This will:
 - Download Gradle 8.10 (first run only via wrapper)
+- Download JavaCV + FFmpeg natives (~300 MB, cached in Gradle home)
 - Auto-generate a self-signed PKCS12 keystore at `src/main/resources/keystore.p12` via `keytool`
 - Compile all Java sources
 - Package the Spring Boot fat JAR
@@ -93,13 +79,19 @@ This will:
 ```
 
 The backend starts on **`https://localhost:8443`** with:
-- A Swing JFrame (1280x720) with two pages: animated bouncing balls and a loading spinner
+- A Swing JFrame (1280×720) with animated bouncing balls
 - A WSS WebSocket endpoint at `/ws`
-- 30 FPS tile-based screen capture broadcast using binary WebSocket frames
+- 20 FPS H.264-encoded screen capture broadcast via binary WebSocket frames
 
 ### 3. Verify
 
 Visit `https://localhost:8443` in a browser and accept the self-signed certificate warning. You should see a blank page (no static content is served). The Swing window should be visible on your desktop.
+
+Check the logs for encoder initialization:
+```
+INFO  c.v.service.H264EncoderService - Using H.264 encoder: libopenh264
+INFO  c.v.service.H264EncoderService - H.264 encoder started – 1280x720 @ 20 FPS, extradata 30 bytes
+```
 
 ---
 
@@ -130,6 +122,13 @@ npx ng build
 
 Output goes to `frontend/dist/frontend/`. These static files can be served by any web server or copied into the Spring Boot `static/` resources for single-origin deployment.
 
+### Browser Requirements
+
+The frontend uses the **WebCodecs API** (`VideoDecoder`) for hardware-accelerated H.264 decoding. This requires:
+- Chrome 94+ / Edge 94+ / Opera 80+
+- Firefox (behind `dom.media.webcodecs.enabled` flag as of 2026)
+- Safari 16.4+
+
 ---
 
 ## Running Both Together
@@ -155,7 +154,7 @@ Then open **`http://localhost:4200`** in one or more browser tabs.
 
 ## Usage
 
-1. **View** — The VNC canvas renders the Swing application in real time at ~30 FPS.
+1. **View** — The VNC canvas renders the Swing application in real time at ~20 FPS via H.264 video stream.
 2. **Take Control** — Click the "Take Control" button. Only one client may hold the lock at a time. Others see a disabled button.
 3. **Interact** — While holding control, click on the canvas to click Swing components (buttons, text field). Type on the canvas (click it first to focus) to send key presses.
 4. **Release Control** — Click "Release Control" or close the tab (auto-releases).
@@ -177,19 +176,42 @@ Then open **`http://localhost:4200`** in one or more browser tabs.
 
 | Constant               | Value  | Description                                    |
 |------------------------|--------|------------------------------------------------|
-| `TILE_SIZE`            | 32     | Tile dimensions in pixels (32x32)              |
-| `CAPTURE_INTERVAL_MS`  | 33     | Capture period (~30 FPS)                       |
-| `JPEG_QUALITY`         | 0.6    | JPEG compression quality (0.0–1.0)             |
-| `FULL_FRAME_THRESHOLD` | 0.4    | Fraction of changed tiles that triggers a full frame |
-| `FORCE_FULL_INTERVAL`  | 300    | Force a full frame every N captures (~10s)     |
+| `FPS`                  | 20     | Target capture frame rate                      |
+| `CAPTURE_INTERVAL_MS`  | 50     | Capture period (1000 / FPS)                    |
+
+### H.264 Encoder Settings (compile-time in `H264EncoderService`)
+
+| Setting              | Value          | Description                                         |
+|----------------------|----------------|-----------------------------------------------------|
+| Codec                | libx264 or libopenh264 | Prefers libx264 if available                 |
+| Profile              | Baseline       | Maximum browser compatibility                       |
+| Preset               | ultrafast      | Lowest encoding latency (libx264 only)              |
+| Tune                 | zerolatency    | Disables look-ahead buffering (libx264 only)        |
+| CRF                  | 28             | Quality level (libx264 only)                        |
+| Bitrate              | 400 kbps       | Target bitrate (libopenh264 only)                   |
+| GOP size             | 40 frames      | Keyframe every 2 seconds at 20 FPS                  |
+| B-frames             | 0              | No bidirectional frames (lowest latency)            |
 
 ### WebSocket Limits (`WebSocketConfig`)
 
 | Setting                     | Value    | Description                              |
 |-----------------------------|----------|------------------------------------------|
 | Max text message buffer     | 2 MB     | For lock status JSON                     |
-| Max binary message buffer   | 2 MB     | Accommodates full-frame binary (~920 tiles) |
+| Max binary message buffer   | 2 MB     | Accommodates H.264 keyframes             |
 | Max session idle timeout    | 1 hour   | Keep-alive for viewers                   |
+
+---
+
+## Bandwidth
+
+The H.264 video codec uses temporal compression (inter-frame prediction), dramatically reducing bandwidth compared to per-tile JPEG encoding:
+
+| Metric              | Old (JPEG tiles)          | New (H.264)                |
+|---------------------|---------------------------|----------------------------|
+| Frame size (avg)    | ~30 KB                    | ~1-3 KB (delta frames)     |
+| Bandwidth/client    | ~600 KB/s                 | ~40 KB/s                   |
+| 20 clients          | ~12 MB/s                  | ~800 KB/s                  |
+| Keyframe size       | ~30 KB (full frame)       | ~15-25 KB (every 2s)       |
 
 ---
 
@@ -198,8 +220,14 @@ Then open **`http://localhost:4200`** in one or more browser tabs.
 ### "Canvas stays black"
 
 - Ensure the backend is running and the Swing window is visible on the desktop.
-- Check browser DevTools → Console for WebSocket connection errors.
+- Check browser DevTools → Console for `VideoDecoder error` messages.
+- Verify your browser supports the WebCodecs API (Chrome 94+, Safari 16.4+).
 - If using the production build (not dev server), you must accept the self-signed cert at `https://localhost:8443` first.
+
+### "VideoDecoder error: NotSupportedError"
+
+- The browser may not support the H.264 Baseline profile. Try Chrome or Edge.
+- Check that the backend encoder is producing valid extradata (look for `extradata XX bytes` in the logs).
 
 ### "WebSocket connection refused"
 

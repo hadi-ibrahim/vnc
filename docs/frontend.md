@@ -5,8 +5,8 @@
 - **Angular 19.2** (standalone components, signals, zone.js)
 - **TypeScript 5.7**
 - **Native WebSocket API** (no RxJS WebSocket wrapper)
-- **Canvas 2D API** for tile-based rendering
-- **`createImageBitmap`** for off-main-thread JPEG decoding
+- **WebCodecs API** (`VideoDecoder`) for hardware-accelerated H.264 decoding
+- **Canvas 2D API** for video frame rendering
 
 ## Source Structure
 
@@ -17,10 +17,10 @@ frontend/src/app/
 ├── app.component.css           # Root styles
 ├── app.config.ts               # Application bootstrap config
 ├── services/
-│   └── vnc.service.ts          # WebSocket + binary frame parsing + state
+│   └── vnc.service.ts          # WebSocket + H.264 frame parsing + state
 └── components/
     └── vnc-canvas/
-        └── vnc-canvas.component.ts  # Canvas renderer + input forwarding
+        └── vnc-canvas.component.ts  # WebCodecs decoder + canvas renderer + input forwarding
 ```
 
 ---
@@ -51,37 +51,47 @@ The root shell. Provides the header bar with connection status and lock control.
 
 ### `VncCanvasComponent`
 
-Renders the VNC stream onto an HTML5 Canvas and forwards user input.
+Renders the H.264 video stream onto an HTML5 Canvas using the WebCodecs `VideoDecoder` API.
 
 **Canvas setup:**
 - Fixed dimensions: 1280×720 (matches server resolution)
 - CSS `max-width: 100%` with `height: auto` for responsive scaling
 - `tabindex="0"` for keyboard focus
 
-**Rendering modes:**
+**Video decoding pipeline:**
 
-#### Diff Frames (`full: false`)
-
-Each tile's raw JPEG bytes (received as `Uint8Array` from the binary frame) are decoded off-main-thread and drawn directly onto the visible canvas:
-
-```typescript
-private decodeTile(jpeg: Uint8Array): Promise<ImageBitmap> {
-    return createImageBitmap(new Blob([jpeg], { type: 'image/jpeg' }));
+```
+Codec config (Uint8Array)
+    │
+    ▼
+VideoDecoder.configure({
+    codec: 'avc1.42001e',       // H.264 Baseline Level 3.0
+    codedWidth: 1280,
+    codedHeight: 720,
+    description: spsAndPps      // AVCC format from server
+})
+    │
+    ▼
+H.264 frame (Uint8Array) → EncodedVideoChunk
+    │                          type: 'key' | 'delta'
+    │                          timestamp: microseconds
+    ▼
+VideoDecoder.decode(chunk)
+    │
+    ▼
+output callback: (frame: VideoFrame) => {
+    ctx.drawImage(frame, 0, 0)  // Canvas 2D natively accepts VideoFrame
+    frame.close()               // Release GPU memory
 }
 ```
 
-Tile-by-tile updates are imperceptible to the user since only a few tiles change per frame.
+**Decoder lifecycle:**
 
-#### Full Frames (`full: true`)
-
-Uses double-buffering to prevent visible flicker:
-
-1. The current visible canvas is copied to an offscreen canvas.
-2. All 920 tiles are decoded via `createImageBitmap` and drawn onto the offscreen canvas.
-3. `Promise.all()` waits for all tile decodes to complete.
-4. The offscreen canvas is blitted atomically to the visible canvas via `drawImage()`.
-
-This prevents the "progressive refresh" artifact that would otherwise occur when hundreds of tiles decode at slightly different times.
+1. On receiving a codec config message (first byte 0xFF), the component stores the AVCC data and calls `initDecoder()`
+2. `initDecoder()` creates a new `VideoDecoder` with output/error callbacks, then calls `configure()` with the codec string and description
+3. Any keyframes received before the decoder is configured are buffered in `pendingFrames` and flushed after configuration
+4. Each H.264 frame is wrapped in an `EncodedVideoChunk` and fed to `decode()`
+5. On disconnect or component destruction, the decoder is closed to free resources
 
 **Input forwarding:**
 
@@ -127,20 +137,24 @@ connect()
   ├── onclose → connected.set(false), scheduleReconnect()
   ├── onerror → ws.close()  (triggers onclose)
   └── onmessage:
-        ├── event.data instanceof ArrayBuffer → handleBinaryFrame()
-        └── otherwise → JSON.parse() for lockStatus
+        ├── event.data instanceof ArrayBuffer → handleBinaryMessage()
+        └── otherwise → handleTextMessage() for lockStatus
 ```
 
-**Binary frame parsing (`handleBinaryFrame`):**
+**Binary message parsing (`handleBinaryMessage`):**
 
-Parses the binary wire format using `DataView`:
+Distinguishes message types by the first byte:
 
-1. Read `flags` (uint8) and `tileCount` (uint16 big-endian) from the 3-byte header.
-2. For each tile: read column (uint8), row (uint8), JPEG length (uint32 big-endian).
-3. Slice the `ArrayBuffer` to get a `Uint8Array` view of the raw JPEG bytes.
-4. Pass the parsed `FrameMessage` to the registered frame callback.
+| First byte | Message type     | Action                              |
+|------------|------------------|-------------------------------------|
+| `0xFF`     | Codec config     | Extract bytes [1..], invoke `configCallback` |
+| Other      | H.264 frame      | Parse flags, timestamp, data, invoke `frameCallback` |
 
-No Base64 decoding, no JSON parsing, no string allocation — just `DataView` reads and `Uint8Array` slices.
+Frame parsing:
+1. Read `flags` (uint8) — bit 0 indicates keyframe
+2. Read `timestamp` (uint32 big-endian) — milliseconds from encoder start
+3. Slice remaining bytes as H.264 access unit data
+4. Pass `{ keyframe, timestamp, data }` to the registered frame callback
 
 **Reconnect logic:**
 
@@ -155,6 +169,13 @@ const url = `${protocol}//${location.host}/ws`;
 
 This works in both development (proxied through Angular dev server) and production (same-origin deployment).
 
+**Callbacks:**
+
+| Method                      | Description                                     |
+|-----------------------------|-------------------------------------------------|
+| `onFrame(callback)`         | Register H.264 frame callback                   |
+| `onConfig(callback)`        | Register codec config callback                   |
+
 **Public API:**
 
 | Method                      | Description                           |
@@ -162,36 +183,45 @@ This works in both development (proxied through Angular dev server) and producti
 | `connect()`                 | Establish WebSocket connection        |
 | `disconnect()`              | Close connection, stop reconnect      |
 | `onFrame(callback)`         | Register frame render callback        |
+| `onConfig(callback)`        | Register codec config callback        |
 | `sendClick(x, y)`           | Send click command (rounded coords)   |
 | `sendKey(key)`              | Send key command                      |
 | `requestLock()`             | Send lock request                     |
 | `releaseLock()`             | Send unlock request                   |
-
-**Message handling:**
-
-| Server Message      | Frame Type | Action                                                |
-|---------------------|------------|-------------------------------------------------------|
-| Frame data          | Binary     | Parse header + tiles, invoke `frameCallback`          |
-| `lockStatus`        | Text       | JSON parse, update `isLocked` and `isController` signals |
 
 ---
 
 ## TypeScript Interfaces
 
 ```typescript
-export interface TileData {
-  x: number;       // tile column index
-  y: number;       // tile row index
-  jpeg: Uint8Array; // raw JPEG bytes (sliced from the binary frame)
+export interface LockStatusMessage {
+  type: 'lockStatus';
+  locked: boolean;
+  you: boolean;
 }
 
-export interface FrameMessage {
-  full: boolean;    // true = all tiles, false = diff only
-  tiles: TileData[];
+export interface H264Frame {
+  keyframe: boolean;     // true = IDR frame, false = P-frame
+  timestamp: number;     // milliseconds from encoder start
+  data: Uint8Array;      // H.264 access unit (AVCC format)
 }
 ```
 
-Note: `TileData.jpeg` is a `Uint8Array` view into the original `ArrayBuffer` — no data copying occurs during parsing.
+---
+
+## WebCodecs Browser Support
+
+The frontend requires the **WebCodecs API** for H.264 video decoding:
+
+| Browser        | Minimum Version | Notes                                     |
+|----------------|-----------------|-------------------------------------------|
+| Chrome         | 94+             | Full support                              |
+| Edge           | 94+             | Full support (Chromium-based)             |
+| Safari         | 16.4+           | Full support                              |
+| Firefox        | Behind flag     | `dom.media.webcodecs.enabled`             |
+| Opera          | 80+             | Full support (Chromium-based)             |
+
+The `VideoDecoder` is configured with codec string `'avc1.42001e'` (H.264 Baseline, Level 3.0), which has the broadest hardware decoder support across devices.
 
 ---
 

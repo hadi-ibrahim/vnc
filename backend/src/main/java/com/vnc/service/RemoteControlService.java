@@ -1,14 +1,20 @@
 package com.vnc.service;
 
 import com.vnc.swing.SwingApp;
-import com.vnc.util.JpegCodec;
 import org.springframework.stereotype.Service;
 
+import javax.imageio.IIOImage;
+import javax.imageio.ImageIO;
+import javax.imageio.ImageWriteParam;
+import javax.imageio.ImageWriter;
+import javax.imageio.stream.ImageOutputStream;
 import javax.swing.*;
 import java.awt.*;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseEvent;
 import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 
 @Service
@@ -42,7 +48,26 @@ public class RemoteControlService {
         } catch (InvocationTargetException e) {
             return new byte[0];
         }
-        return JpegCodec.encode(image, JPEG_QUALITY);
+        return encodeJpeg(image);
+    }
+
+    private static byte[] encodeJpeg(BufferedImage image) {
+        var baos = new ByteArrayOutputStream(4096);
+        ImageWriter writer = ImageIO.getImageWritersByFormatName("jpeg").next();
+        try {
+            ImageWriteParam param = writer.getDefaultWriteParam();
+            param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+            param.setCompressionQuality(JPEG_QUALITY);
+            try (ImageOutputStream ios = ImageIO.createImageOutputStream(baos)) {
+                writer.setOutput(ios);
+                writer.write(null, new IIOImage(image, null, null), param);
+            }
+        } catch (IOException e) {
+            return new byte[0];
+        } finally {
+            writer.dispose();
+        }
+        return baos.toByteArray();
     }
 
     public void click(int x, int y) {

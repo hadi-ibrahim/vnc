@@ -4,7 +4,7 @@
 
 - **Endpoint:** `wss://localhost:8443/ws`
 - **Transport:** WebSocket over TLS (WSS)
-- **Frame encoding:** Binary frames for screen data, JSON text frames for control messages
+- **Frame encoding:** Binary frames for H.264 video data + codec config, JSON text frames for control messages
 - **Client `binaryType`:** `arraybuffer`
 - **Max message size:** 2 MB
 
@@ -12,44 +12,65 @@
 
 ### Server → Client
 
-#### Frame (Binary)
+#### Codec Config (Binary)
 
-Sent as a **WebSocket binary frame** at ~30 FPS when the screen changes. This avoids the overhead of JSON serialization and Base64 encoding.
+Sent once when the encoder starts and to each new client on connection. Contains the H.264 SPS and PPS parameters needed to initialize the decoder.
 
 **Wire format:**
 
 ```
-Header (3 bytes):
-  [0]      uint8   flags — bit 0: 1 = full frame, 0 = diff frame
-  [1-2]    uint16  tile count (big-endian)
-
-Per tile (variable length, repeated `tileCount` times):
-  [0]      uint8   column index (0–39)
-  [1]      uint8   row index (0–22)
-  [2-5]    uint32  JPEG byte length (big-endian)
-  [6..]    bytes   raw JPEG data (not Base64-encoded)
+[0]      uint8   0xFF (config marker — distinguishes from frame messages)
+[1..]    bytes   AVCDecoderConfigurationRecord (SPS + PPS in AVCC format)
 ```
 
-| Field          | Type     | Description                                              |
-|----------------|----------|----------------------------------------------------------|
-| `flags`        | `uint8`  | Bit 0 = full frame                                       |
-| `tileCount`    | `uint16` | Number of tiles in this frame (big-endian)               |
-| `tile.col`     | `uint8`  | Tile column index (0–39)                                 |
-| `tile.row`     | `uint8`  | Tile row index (0–22)                                    |
-| `tile.jpegLen` | `uint32` | Length of the following JPEG data in bytes (big-endian)   |
-| `tile.jpeg`    | `bytes`  | Raw JPEG-compressed tile pixels                          |
+The AVCC record structure:
 
-**Tile grid:** 1280x720 resolution divided into 32x32 tiles = 40 columns × 23 rows (920 tiles total). The bottom row tiles are 32x16 pixels.
-
-**Full vs diff:**
-- **Diff frame** (flags bit 0 = 0): contains only tiles that changed since the last capture. The client draws them on top of the existing canvas.
-- **Full frame** (flags bit 0 = 1): contains all 920 tiles. Sent when >40% of tiles changed, or every ~10 seconds as a forced resync. The client should replace the entire canvas atomically.
-
-**Example (hex) — diff frame with 2 tiles:**
 ```
-00 00 02                          ← flags=0 (diff), tileCount=2
-0C 05 00 00 03 E8 [1000 bytes]   ← col=12, row=5, jpegLen=1000, jpeg...
-0D 05 00 00 04 10 [1040 bytes]   ← col=13, row=5, jpegLen=1040, jpeg...
+[0]   version (0x01)
+[1]   profile_idc (e.g. 0x42 = Baseline)
+[2]   constraint_set flags
+[3]   level_idc (e.g. 0x1F = Level 3.1)
+[4]   0xFF (4-byte NAL length prefix)
+[5]   0xE1 (1 SPS)
+[6-7] SPS length (big-endian uint16)
+[8..] SPS NAL unit data
+[..]  0x01 (1 PPS)
+[..]  PPS length (big-endian uint16)
+[..]  PPS NAL unit data
+```
+
+This is passed directly to the WebCodecs `VideoDecoder.configure()` `description` parameter.
+
+#### Frame (Binary)
+
+Sent as a **WebSocket binary frame** at ~20 FPS. Contains one H.264 access unit (one frame's encoded NAL units in AVCC length-prefixed format).
+
+**Wire format:**
+
+```
+[0]      uint8   flags — bit 0: 1 = keyframe (IDR), 0 = delta frame (P-frame)
+[1-4]    uint32  timestamp (big-endian, milliseconds from stream start)
+[5..]    bytes   H.264 access unit (NAL units with 4-byte length prefixes)
+```
+
+| Field       | Type     | Description                                              |
+|-------------|----------|----------------------------------------------------------|
+| `flags`     | `uint8`  | Bit 0 = keyframe (IDR frame)                             |
+| `timestamp` | `uint32` | Milliseconds since encoder start (big-endian)            |
+| `data`      | `bytes`  | H.264 NAL units in AVCC format (4-byte length prefixed)  |
+
+**Keyframe vs delta:**
+- **Keyframe (IDR):** Self-contained frame that can be decoded independently. Sent every 2 seconds (GOP size = 40 frames at 20 FPS) and cached by the server for new client initialization.
+- **Delta frame (P-frame):** Encodes only differences from the previous frame using motion vectors and residuals. Typically 1-3 KB for screen content with small moving objects.
+
+**Example (hex) — delta frame:**
+```
+00 00 00 1A 2C [payload]   ← flags=0 (delta), timestamp=6700ms, H.264 data
+```
+
+**Example (hex) — keyframe:**
+```
+01 00 00 00 00 [payload]   ← flags=1 (keyframe), timestamp=0ms, H.264 data
 ```
 
 #### `lockStatus` (JSON Text)
@@ -138,12 +159,17 @@ Succeeds only if the sender currently holds the lock. On success, the server bro
 
 ## Client Message Dispatch
 
-The client distinguishes server messages by WebSocket frame type:
+The client distinguishes server messages by WebSocket frame type and first byte:
 
 ```
 ws.onmessage = (event) => {
-    if (event.data instanceof ArrayBuffer)  → parse binary frame header + tiles
-    else                                    → JSON.parse() for lockStatus
+    if (event.data instanceof ArrayBuffer) {
+        const view = new Uint8Array(event.data);
+        if (view[0] === 0xFF)  → codec config (SPS+PPS)
+        else                   → H.264 video frame
+    } else {
+        → JSON.parse() for lockStatus
+    }
 }
 ```
 
@@ -155,10 +181,12 @@ Client                            Server
   │──── WebSocket CONNECT ──────────▶│
   │     (binaryType: arraybuffer)    │ addClient(sessionId)
   │◀──── lockStatus (text JSON) ────│ (initial lock state)
-  │◀──── frame (binary, full) ──────│ (cached, if available)
+  │◀──── codec config (binary) ─────│ (SPS+PPS for decoder init)
+  │◀──── keyframe (binary) ─────────│ (cached, if available)
   │                                  │
-  │◀──── frame (binary, diff) ──────│ (30 FPS stream)
-  │◀──── frame (binary, diff) ──────│
+  │◀──── frame (binary, delta) ─────│ (20 FPS H.264 stream)
+  │◀──── frame (binary, delta) ─────│
+  │◀──── frame (binary, key) ───────│ (every ~2 seconds)
   │                                  │
   │──── { type: "lock" } (text) ───▶│ tryLock(sessionId)
   │◀──── lockStatus (text JSON) ────│
@@ -186,3 +214,5 @@ This guarantees:
 - At most 1 frame in-flight per client
 - No unbounded queue buildup
 - Slow clients lose frames rather than causing memory pressure
+
+Since H.264 delta frames depend on previous frames, dropped frames can cause brief visual artifacts until the next keyframe (every ~2 seconds) resyncs the decoder.

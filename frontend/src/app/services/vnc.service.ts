@@ -1,27 +1,23 @@
 import { Injectable, signal } from '@angular/core';
 
-export interface TileData {
-  x: number;
-  y: number;
-  jpeg: Uint8Array;
-}
-
-export interface FrameMessage {
-  full: boolean;
-  tiles: TileData[];
-}
-
-interface LockStatusMessage {
+export interface LockStatusMessage {
   type: 'lockStatus';
   locked: boolean;
   you: boolean;
+}
+
+export interface H264Frame {
+  keyframe: boolean;
+  timestamp: number;
+  data: Uint8Array;
 }
 
 @Injectable({ providedIn: 'root' })
 export class VncService {
   private ws: WebSocket | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private frameCallback: ((msg: FrameMessage) => void) | null = null;
+  private frameCallback: ((frame: H264Frame) => void) | null = null;
+  private configCallback: ((config: Uint8Array) => void) | null = null;
 
   readonly connected = signal(false);
   readonly isController = signal(false);
@@ -53,15 +49,9 @@ export class VncService {
 
     ws.onmessage = (event: MessageEvent) => {
       if (event.data instanceof ArrayBuffer) {
-        this.handleBinaryFrame(event.data);
+        this.handleBinaryMessage(event.data);
       } else {
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === 'lockStatus') {
-            this.isLocked.set(msg.locked);
-            this.isController.set(msg.you);
-          }
-        } catch { /* ignore malformed text */ }
+        this.handleTextMessage(event.data);
       }
     };
 
@@ -76,8 +66,12 @@ export class VncService {
     this.isLocked.set(false);
   }
 
-  onFrame(callback: (msg: FrameMessage) => void): void {
+  onFrame(callback: (frame: H264Frame) => void): void {
     this.frameCallback = callback;
+  }
+
+  onConfig(callback: (config: Uint8Array) => void): void {
+    this.configCallback = callback;
   }
 
   sendClick(x: number, y: number): void {
@@ -102,34 +96,38 @@ export class VncService {
     }
   }
 
-  /**
-   * Binary frame layout:
-   *   [0]      uint8   flags (bit 0 = full)
-   *   [1-2]    uint16  tile count (BE)
-   *   Per tile:
-   *     [0]    uint8   col
-   *     [1]    uint8   row
-   *     [2-5]  uint32  jpeg length (BE)
-   *     [6..]  raw jpeg bytes
-   */
-  private handleBinaryFrame(buffer: ArrayBuffer): void {
-    const view = new DataView(buffer);
-    const full = (view.getUint8(0) & 1) !== 0;
-    const tileCount = view.getUint16(1, false);
+  private handleBinaryMessage(buffer: ArrayBuffer): void {
+    const view = new Uint8Array(buffer);
+    if (view.length < 1) return;
 
-    const tiles: TileData[] = [];
-    let offset = 3;
+    const firstByte = view[0];
 
-    for (let i = 0; i < tileCount; i++) {
-      const x = view.getUint8(offset);
-      const y = view.getUint8(offset + 1);
-      const jpegLen = view.getUint32(offset + 2, false);
-      const jpeg = new Uint8Array(buffer, offset + 6, jpegLen);
-      tiles.push({ x, y, jpeg });
-      offset += 6 + jpegLen;
+    if (firstByte === 0xFF) {
+      const config = view.slice(1);
+      this.configCallback?.(config);
+      return;
     }
 
-    this.frameCallback?.({ full, tiles });
+    if (view.length < 5) return;
+
+    const dataView = new DataView(buffer);
+    const keyframe = (firstByte & 1) !== 0;
+    const timestamp = dataView.getUint32(1, false);
+    const data = view.slice(5);
+
+    this.frameCallback?.({ keyframe, timestamp, data });
+  }
+
+  private handleTextMessage(text: string): void {
+    try {
+      const msg = JSON.parse(text);
+      if (msg.type === 'lockStatus') {
+        this.isLocked.set(msg.locked);
+        this.isController.set(msg.you);
+      }
+    } catch {
+      // ignore malformed messages
+    }
   }
 
   private cleanup(): void {
