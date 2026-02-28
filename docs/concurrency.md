@@ -43,6 +43,7 @@ All Swing component access is confined to the EDT:
 | Frame capture (paint)       | EDT                | `invokeAndWait()` from capture thread   |
 | Click dispatch              | EDT                | `invokeLater()` from Tomcat NIO thread  |
 | Key dispatch                | EDT                | `invokeLater()` from Tomcat NIO thread  |
+| Page switching (CardLayout) | EDT                | `invokeLater()` in `SwingApp.showPage()` |
 | JFrame disposal             | EDT                | `invokeLater()` in `SwingApp.stop()`    |
 
 The `SwingApp.frame` field is `volatile`, ensuring visibility from the capture thread and Tomcat threads that read it.
@@ -70,11 +71,19 @@ currentFrame = temp;
 ```
 Both images are only written inside the `capturing` guard, which is single-threaded.
 
+Binary frame assembly (`buildBinaryFrame`) runs on the capture thread. The resulting `byte[]` is immutable once constructed and safely shared with virtual send threads.
+
+### JpegCodec
+
+Thread safety is achieved via `ThreadLocal<Pointer>` — each thread that calls `JpegCodec.encode()` gets its own TurboJPEG compressor handle. The capture thread and Tomcat NIO threads (via `RemoteControlService.getSnapshot()`) can call `encode()` concurrently without contention.
+
+The ImageIO fallback path creates a new `ImageWriter` per call, which is inherently thread-safe.
+
 ### BroadcastService
 
 **Client registry:** `ConcurrentHashMap<String, ClientSession>` provides safe concurrent iteration during broadcast while Tomcat threads add/remove clients.
 
-**Frame serialization:** JSON serialization happens once per frame on the capture thread. The resulting `TextMessage` is immutable and safely shared across virtual send threads.
+**Frame serialization:** Binary frame bytes are packed once on the capture thread. The resulting `BinaryMessage` wraps an immutable `byte[]` and is safely shared across virtual send threads.
 
 **Per-client send:** Each `ClientSession` has an `AtomicBoolean inFlight`:
 
@@ -90,7 +99,7 @@ Capture thread:                     Virtual send thread:
   │                                   │
 ```
 
-The `synchronized(session)` block prevents overlapping writes to the same WebSocket session from `broadcast()` and `sendTo()` (used for lock status messages).
+The `synchronized(session)` block prevents overlapping writes to the same WebSocket session from `broadcastFrame()` and `sendTo()` (used for lock status text messages).
 
 ### ControlLockService
 
@@ -120,13 +129,15 @@ This is lock-free and linearizable. No mutex contention under load.
 |---------------------|------------------------------------|---------------------------------|
 | `BufferedImage` (current/previous) | CaptureService field  | Service shutdown               |
 | Tile `BufferedImage` (32x32)       | Per-capture, method local | After JPEG encode completes  |
-| `TextMessage` (frame JSON)         | Per-broadcast           | After all virtual sends finish |
-| `lastFullFrame` cache              | `volatile` field        | Replaced by next full frame    |
+| `byte[]` binary frame              | Per-broadcast           | After all virtual sends finish |
+| `BinaryMessage` (lastFullFrame)    | `volatile` field        | Replaced by next full frame    |
 | `ClientSession`                    | ConcurrentHashMap entry | `removeClient()` call          |
+| TurboJPEG compressor (`Pointer`)   | ThreadLocal             | Thread termination             |
 
 ### No Unbounded Growth
 
-- Tile JPEG bytes are allocated per-capture and become garbage after Base64 encoding.
-- The `lastFullFrame` cache holds exactly one `TextMessage` at a time.
+- Tile JPEG bytes are allocated per-capture and become garbage after binary frame assembly.
+- The `lastFullFrame` cache holds exactly one `BinaryMessage` at a time.
 - Virtual threads are short-lived (one send operation) and exit promptly.
 - `ConcurrentHashMap` entries are bounded by the number of connected clients (~20 max).
+- TurboJPEG native compressor handles are held per-thread in `ThreadLocal` — bounded by the small number of threads that call `encode()`.

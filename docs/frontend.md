@@ -6,6 +6,7 @@
 - **TypeScript 5.7**
 - **Native WebSocket API** (no RxJS WebSocket wrapper)
 - **Canvas 2D API** for tile-based rendering
+- **`createImageBitmap`** for off-main-thread JPEG decoding
 
 ## Source Structure
 
@@ -16,7 +17,7 @@ frontend/src/app/
 ├── app.component.css           # Root styles
 ├── app.config.ts               # Application bootstrap config
 ├── services/
-│   └── vnc.service.ts          # WebSocket + state management
+│   └── vnc.service.ts          # WebSocket + binary frame parsing + state
 └── components/
     └── vnc-canvas/
         └── vnc-canvas.component.ts  # Canvas renderer + input forwarding
@@ -61,12 +62,12 @@ Renders the VNC stream onto an HTML5 Canvas and forwards user input.
 
 #### Diff Frames (`full: false`)
 
-Each tile is decoded independently and drawn directly onto the visible canvas:
+Each tile's raw JPEG bytes (received as `Uint8Array` from the binary frame) are decoded off-main-thread and drawn directly onto the visible canvas:
 
 ```typescript
-const img = new Image();
-img.onload = () => this.ctx.drawImage(img, dx, dy);
-img.src = 'data:image/jpeg;base64,' + tile.data;
+private decodeTile(jpeg: Uint8Array): Promise<ImageBitmap> {
+    return createImageBitmap(new Blob([jpeg], { type: 'image/jpeg' }));
+}
 ```
 
 Tile-by-tile updates are imperceptible to the user since only a few tiles change per frame.
@@ -76,11 +77,11 @@ Tile-by-tile updates are imperceptible to the user since only a few tiles change
 Uses double-buffering to prevent visible flicker:
 
 1. The current visible canvas is copied to an offscreen canvas.
-2. All 920 tiles are decoded and drawn onto the offscreen canvas.
-3. A counter tracks remaining tile loads.
-4. When the last tile's `onload` fires, the offscreen canvas is blitted atomically to the visible canvas via `drawImage()`.
+2. All 920 tiles are decoded via `createImageBitmap` and drawn onto the offscreen canvas.
+3. `Promise.all()` waits for all tile decodes to complete.
+4. The offscreen canvas is blitted atomically to the visible canvas via `drawImage()`.
 
-This prevents the "progressive refresh" artifact that would otherwise occur when hundreds of tiles load at slightly different times.
+This prevents the "progressive refresh" artifact that would otherwise occur when hundreds of tiles decode at slightly different times.
 
 **Input forwarding:**
 
@@ -120,12 +121,26 @@ connect()
   │
   ├── cleanup() — close existing connection, clear handlers
   ├── new WebSocket(url)
+  ├── ws.binaryType = 'arraybuffer'
   │
   ├── onopen  → connected.set(true), clearReconnect()
   ├── onclose → connected.set(false), scheduleReconnect()
   ├── onerror → ws.close()  (triggers onclose)
-  └── onmessage → handleMessage(JSON.parse(data))
+  └── onmessage:
+        ├── event.data instanceof ArrayBuffer → handleBinaryFrame()
+        └── otherwise → JSON.parse() for lockStatus
 ```
+
+**Binary frame parsing (`handleBinaryFrame`):**
+
+Parses the binary wire format using `DataView`:
+
+1. Read `flags` (uint8) and `tileCount` (uint16 big-endian) from the 3-byte header.
+2. For each tile: read column (uint8), row (uint8), JPEG length (uint32 big-endian).
+3. Slice the `ArrayBuffer` to get a `Uint8Array` view of the raw JPEG bytes.
+4. Pass the parsed `FrameMessage` to the registered frame callback.
+
+No Base64 decoding, no JSON parsing, no string allocation — just `DataView` reads and `Uint8Array` slices.
 
 **Reconnect logic:**
 
@@ -154,10 +169,29 @@ This works in both development (proxied through Angular dev server) and producti
 
 **Message handling:**
 
-| Server Message  | Action                                                |
-|-----------------|-------------------------------------------------------|
-| `frame`         | Invoke `frameCallback` (registered by canvas component)|
-| `lockStatus`    | Update `isLocked` and `isController` signals          |
+| Server Message      | Frame Type | Action                                                |
+|---------------------|------------|-------------------------------------------------------|
+| Frame data          | Binary     | Parse header + tiles, invoke `frameCallback`          |
+| `lockStatus`        | Text       | JSON parse, update `isLocked` and `isController` signals |
+
+---
+
+## TypeScript Interfaces
+
+```typescript
+export interface TileData {
+  x: number;       // tile column index
+  y: number;       // tile row index
+  jpeg: Uint8Array; // raw JPEG bytes (sliced from the binary frame)
+}
+
+export interface FrameMessage {
+  full: boolean;    // true = all tiles, false = diff only
+  tiles: TileData[];
+}
+```
+
+Note: `TileData.jpeg` is a `Uint8Array` view into the original `ArrayBuffer` — no data copying occurs during parsing.
 
 ---
 

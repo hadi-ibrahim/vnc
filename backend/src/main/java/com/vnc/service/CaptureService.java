@@ -1,7 +1,5 @@
 package com.vnc.service;
 
-import com.vnc.model.FrameMessage;
-import com.vnc.model.TileData;
 import com.vnc.swing.SwingApp;
 import com.vnc.util.JpegCodec;
 import org.slf4j.Logger;
@@ -14,7 +12,6 @@ import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Base64;
 import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -33,8 +30,8 @@ public class CaptureService implements SmartLifecycle {
     static final int ROWS = (HEIGHT + TILE_SIZE - 1) / TILE_SIZE;
     private static final float FULL_FRAME_THRESHOLD = 0.4f;
     private static final float JPEG_QUALITY = 0.6f;
-    private static final long CAPTURE_INTERVAL_MS = 33;
-    private static final int FORCE_FULL_INTERVAL = 300;
+    private static final long CAPTURE_INTERVAL_MS = 50;
+    private static final int FORCE_FULL_INTERVAL = 200;
 
     private final SwingApp swingApp;
     private final BroadcastService broadcastService;
@@ -116,7 +113,7 @@ public class CaptureService implements SmartLifecycle {
             frameCount++;
             boolean forceFullFrame = frameCount % FORCE_FULL_INTERVAL == 0;
 
-            List<TileData> changedTiles = new ArrayList<>();
+            List<EncodedTile> changedTiles = new ArrayList<>();
             int totalTiles = COLS * ROWS;
 
             for (int row = 0; row < ROWS; row++) {
@@ -135,7 +132,7 @@ public class CaptureService implements SmartLifecycle {
             boolean full = forceFullFrame
                     || (float) changedTiles.size() / totalTiles > FULL_FRAME_THRESHOLD;
 
-            List<TileData> tilesToSend;
+            List<EncodedTile> tilesToSend;
             if (full) {
                 tilesToSend = encodeAllTiles();
             } else if (!changedTiles.isEmpty()) {
@@ -144,7 +141,7 @@ public class CaptureService implements SmartLifecycle {
                 return;
             }
 
-            broadcastService.broadcast(new FrameMessage(full, tilesToSend), full);
+            broadcastService.broadcastFrame(buildBinaryFrame(full, tilesToSend), full);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (Exception e) {
@@ -161,17 +158,16 @@ public class CaptureService implements SmartLifecycle {
         return Arrays.mismatch(currentPixels, 0, count, previousPixels, 0, count) >= 0;
     }
 
-    private TileData encodeTile(int col, int row, int tx, int ty, int tw, int th) {
+    private EncodedTile encodeTile(int col, int row, int tx, int ty, int tw, int th) {
         BufferedImage tile = new BufferedImage(tw, th, BufferedImage.TYPE_INT_RGB);
         Graphics2D g = tile.createGraphics();
         g.drawImage(currentFrame, 0, 0, tw, th, tx, ty, tx + tw, ty + th, null);
         g.dispose();
-        byte[] jpeg = JpegCodec.encode(tile, JPEG_QUALITY);
-        return new TileData(col, row, Base64.getEncoder().encodeToString(jpeg));
+        return new EncodedTile(col, row, JpegCodec.encode(tile, JPEG_QUALITY));
     }
 
-    private List<TileData> encodeAllTiles() {
-        List<TileData> tiles = new ArrayList<>(COLS * ROWS);
+    private List<EncodedTile> encodeAllTiles() {
+        List<EncodedTile> tiles = new ArrayList<>(COLS * ROWS);
         for (int row = 0; row < ROWS; row++) {
             for (int col = 0; col < COLS; col++) {
                 int tx = col * TILE_SIZE;
@@ -182,5 +178,44 @@ public class CaptureService implements SmartLifecycle {
             }
         }
         return tiles;
+    }
+
+    /**
+     * Binary frame format:
+     * <pre>
+     * [0]      uint8   flags (bit 0 = full frame)
+     * [1-2]    uint16  tile count (big-endian)
+     * Per tile:
+     *   [0]    uint8   column
+     *   [1]    uint8   row
+     *   [2-5]  uint32  jpeg byte length (big-endian)
+     *   [6..]  bytes   raw jpeg data
+     * </pre>
+     */
+    private byte[] buildBinaryFrame(boolean full, List<EncodedTile> tiles) {
+        int size = 3;
+        for (var t : tiles) size += 6 + t.jpeg.length;
+
+        byte[] buf = new byte[size];
+        buf[0] = (byte) (full ? 1 : 0);
+        buf[1] = (byte) ((tiles.size() >> 8) & 0xFF);
+        buf[2] = (byte) (tiles.size() & 0xFF);
+
+        int off = 3;
+        for (var t : tiles) {
+            buf[off++] = (byte) t.col;
+            buf[off++] = (byte) t.row;
+            int len = t.jpeg.length;
+            buf[off++] = (byte) ((len >> 24) & 0xFF);
+            buf[off++] = (byte) ((len >> 16) & 0xFF);
+            buf[off++] = (byte) ((len >> 8) & 0xFF);
+            buf[off++] = (byte) (len & 0xFF);
+            System.arraycopy(t.jpeg, 0, buf, off, len);
+            off += len;
+        }
+        return buf;
+    }
+
+    private record EncodedTile(int col, int row, byte[] jpeg) {
     }
 }

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.web.socket.BinaryMessage;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 
@@ -24,7 +25,7 @@ public class BroadcastService {
     private final ConcurrentMap<String, ClientSession> clients = new ConcurrentHashMap<>();
     private final ObjectMapper objectMapper;
     private final ExecutorService sendExecutor = Executors.newVirtualThreadPerTaskExecutor();
-    private volatile TextMessage lastFullFrame;
+    private volatile BinaryMessage lastFullFrame;
 
     public BroadcastService(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
@@ -32,7 +33,7 @@ public class BroadcastService {
 
     public void addClient(String id, WebSocketSession session) {
         clients.put(id, new ClientSession(session));
-        TextMessage cached = lastFullFrame;
+        BinaryMessage cached = lastFullFrame;
         if (cached != null) {
             sendExecutor.submit(() -> {
                 try {
@@ -58,20 +59,12 @@ public class BroadcastService {
         return Set.copyOf(clients.keySet());
     }
 
-    public void broadcast(Object message, boolean isFullFrame) {
+    public void broadcastFrame(byte[] frame, boolean isFull) {
         if (clients.isEmpty()) return;
 
-        String json;
-        try {
-            json = objectMapper.writeValueAsString(message);
-        } catch (JsonProcessingException e) {
-            log.error("Failed to serialize frame message", e);
-            return;
-        }
-
-        TextMessage textMessage = new TextMessage(json);
-        if (isFullFrame) {
-            lastFullFrame = textMessage;
+        BinaryMessage message = new BinaryMessage(frame);
+        if (isFull) {
+            lastFullFrame = message;
         }
 
         clients.forEach((id, client) -> {
@@ -79,7 +72,7 @@ public class BroadcastService {
                 sendExecutor.submit(() -> {
                     try {
                         synchronized (client.session) {
-                            client.session.sendMessage(textMessage);
+                            client.session.sendMessage(message);
                         }
                     } catch (IOException e) {
                         log.debug("Send failed for client {}", id);

@@ -4,46 +4,57 @@
 
 - **Endpoint:** `wss://localhost:8443/ws`
 - **Transport:** WebSocket over TLS (WSS)
-- **Encoding:** JSON text frames
+- **Frame encoding:** Binary frames for screen data, JSON text frames for control messages
+- **Client `binaryType`:** `arraybuffer`
 - **Max message size:** 2 MB
 
 ## Message Types
 
 ### Server → Client
 
-#### `frame`
+#### Frame (Binary)
 
-Sent at ~30 FPS when the screen changes.
+Sent as a **WebSocket binary frame** at ~30 FPS when the screen changes. This avoids the overhead of JSON serialization and Base64 encoding.
 
-```json
-{
-  "type": "frame",
-  "full": false,
-  "tiles": [
-    { "x": 12, "y": 5, "data": "/9j/4AAQSkZJ..." },
-    { "x": 13, "y": 5, "data": "/9j/4AAQSkZJ..." }
-  ]
-}
+**Wire format:**
+
+```
+Header (3 bytes):
+  [0]      uint8   flags — bit 0: 1 = full frame, 0 = diff frame
+  [1-2]    uint16  tile count (big-endian)
+
+Per tile (variable length, repeated `tileCount` times):
+  [0]      uint8   column index (0–39)
+  [1]      uint8   row index (0–22)
+  [2-5]    uint32  JPEG byte length (big-endian)
+  [6..]    bytes   raw JPEG data (not Base64-encoded)
 ```
 
-| Field        | Type       | Description                                                |
-|--------------|------------|------------------------------------------------------------|
-| `type`       | `"frame"`  | Message discriminator                                      |
-| `full`       | `boolean`  | `true` = complete frame (all tiles), `false` = diff only   |
-| `tiles`      | `TileData[]` | Array of changed (or all) tiles                          |
-| `tiles[].x`  | `integer`  | Tile column index (0–39)                                   |
-| `tiles[].y`  | `integer`  | Tile row index (0–22)                                      |
-| `tiles[].data`| `string`  | Base64-encoded JPEG of the 32x32 pixel tile                |
+| Field          | Type     | Description                                              |
+|----------------|----------|----------------------------------------------------------|
+| `flags`        | `uint8`  | Bit 0 = full frame                                       |
+| `tileCount`    | `uint16` | Number of tiles in this frame (big-endian)               |
+| `tile.col`     | `uint8`  | Tile column index (0–39)                                 |
+| `tile.row`     | `uint8`  | Tile row index (0–22)                                    |
+| `tile.jpegLen` | `uint32` | Length of the following JPEG data in bytes (big-endian)   |
+| `tile.jpeg`    | `bytes`  | Raw JPEG-compressed tile pixels                          |
 
 **Tile grid:** 1280x720 resolution divided into 32x32 tiles = 40 columns × 23 rows (920 tiles total). The bottom row tiles are 32x16 pixels.
 
 **Full vs diff:**
-- **Diff frame** (`full: false`): contains only tiles that changed since the last capture. The client draws them on top of the existing canvas.
-- **Full frame** (`full: true`): contains all 920 tiles. Sent when >40% of tiles changed, or every ~10 seconds as a forced resync. The client should replace the entire canvas atomically.
+- **Diff frame** (flags bit 0 = 0): contains only tiles that changed since the last capture. The client draws them on top of the existing canvas.
+- **Full frame** (flags bit 0 = 1): contains all 920 tiles. Sent when >40% of tiles changed, or every ~10 seconds as a forced resync. The client should replace the entire canvas atomically.
 
-#### `lockStatus`
+**Example (hex) — diff frame with 2 tiles:**
+```
+00 00 02                          ← flags=0 (diff), tileCount=2
+0C 05 00 00 03 E8 [1000 bytes]   ← col=12, row=5, jpegLen=1000, jpeg...
+0D 05 00 00 04 10 [1040 bytes]   ← col=13, row=5, jpegLen=1040, jpeg...
+```
 
-Sent to each client individually when lock state changes, and on initial connection.
+#### `lockStatus` (JSON Text)
+
+Sent as a **WebSocket text frame** to each client individually when lock state changes, and on initial connection.
 
 ```json
 {
@@ -60,6 +71,8 @@ Sent to each client individually when lock state changes, and on initial connect
 | `you`    | `boolean`   | `true` if THIS client is the controller             |
 
 ### Client → Server
+
+All client-to-server messages are **JSON text frames**.
 
 #### `click`
 
@@ -123,31 +136,42 @@ Release exclusive control.
 
 Succeeds only if the sender currently holds the lock. On success, the server broadcasts `lockStatus` to all clients.
 
+## Client Message Dispatch
+
+The client distinguishes server messages by WebSocket frame type:
+
+```
+ws.onmessage = (event) => {
+    if (event.data instanceof ArrayBuffer)  → parse binary frame header + tiles
+    else                                    → JSON.parse() for lockStatus
+}
+```
+
 ## Connection Lifecycle
 
 ```
-Client                          Server
-  │                                │
-  │──── WebSocket CONNECT ────────▶│
-  │                                │ addClient(sessionId)
-  │◀──── lockStatus ──────────────│ (initial lock state)
-  │◀──── frame (cached full) ─────│ (if available)
-  │                                │
-  │◀──── frame (diff) ────────────│ (30 FPS stream)
-  │◀──── frame (diff) ────────────│
-  │                                │
-  │──── { type: "lock" } ────────▶│ tryLock(sessionId)
-  │◀──── lockStatus (you: true) ──│
-  │                                │
-  │──── { type: "click" } ───────▶│ remoteControlService.click()
-  │──── { type: "key" } ─────────▶│ remoteControlService.press()
-  │                                │
-  │──── { type: "unlock" } ──────▶│ unlock(sessionId)
-  │◀──── lockStatus (you: false) ─│
-  │                                │
-  │──── WebSocket CLOSE ──────────▶│
-  │                                │ removeClient(sessionId)
-  │                                │ auto-unlock if controller
+Client                            Server
+  │                                  │
+  │──── WebSocket CONNECT ──────────▶│
+  │     (binaryType: arraybuffer)    │ addClient(sessionId)
+  │◀──── lockStatus (text JSON) ────│ (initial lock state)
+  │◀──── frame (binary, full) ──────│ (cached, if available)
+  │                                  │
+  │◀──── frame (binary, diff) ──────│ (30 FPS stream)
+  │◀──── frame (binary, diff) ──────│
+  │                                  │
+  │──── { type: "lock" } (text) ───▶│ tryLock(sessionId)
+  │◀──── lockStatus (text JSON) ────│
+  │                                  │
+  │──── { type: "click" } (text) ──▶│ remoteControlService.click()
+  │──── { type: "key" } (text) ────▶│ remoteControlService.press()
+  │                                  │
+  │──── { type: "unlock" } (text) ─▶│ unlock(sessionId)
+  │◀──── lockStatus (text JSON) ────│
+  │                                  │
+  │──── WebSocket CLOSE ────────────▶│
+  │                                  │ removeClient(sessionId)
+  │                                  │ auto-unlock if controller
 ```
 
 ## Backpressure

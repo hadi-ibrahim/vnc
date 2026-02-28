@@ -8,8 +8,9 @@
 │                                                     │
 │  ┌──────────┐     ┌────────────────┐                │
 │  │ SwingApp │────▶│ AnimatedPanel  │  (EDT, 60 FPS) │
-│  │ (JFrame) │     │ (bouncing balls│                │
-│  └────┬─────┘     └────────────────┘                │
+│  │ (JFrame) │     │ LoadingPanel   │                │
+│  │ CardLayout│     └────────────────┘                │
+│  └────┬─────┘                                       │
 │       │ paint(g)                                    │
 │       ▼                                             │
 │  ┌──────────────┐    ┌──────────────────┐           │
@@ -17,7 +18,8 @@
 │  │ (30 FPS loop)│    │ (virtual threads)│           │
 │  └──────────────┘    └───────┬──────────┘           │
 │       │                      │                      │
-│       │ tile diff + JPEG     │ JSON over WSS        │
+│       │ tile diff + JPEG     │ binary WSS frames    │
+│       │ (TurboJPEG/ImageIO)  │ (+ text for lock)   │
 │       │                      ▼                      │
 │  ┌────────────────┐  ┌──────────────────┐           │
 │  │RemoteControl   │  │VncWebSocketHandler│◀── WSS   │
@@ -31,7 +33,7 @@
 │                      │ (AtomicReference)│           │
 │                      └──────────────────┘           │
 └─────────────────────────────────────────────────────┘
-         │ WSS (JSON frames)
+         │ WSS (binary frames + text JSON)
          ▼
 ┌─────────────────────────────────────────────────────┐
 │              Browser (Angular 19)                    │
@@ -39,9 +41,9 @@
 │  ┌──────────┐    ┌───────────────────┐              │
 │  │VncService│───▶│VncCanvasComponent │              │
 │  │(WebSocket│    │(Canvas 1280x720)  │              │
-│  │ signals) │    │ tile renderer     │              │
-│  └──────────┘    │ double-buffered   │              │
-│                  └───────────────────┘              │
+│  │ binary + │    │ tile renderer     │              │
+│  │ signals) │    │ double-buffered   │              │
+│  └──────────┘    └───────────────────┘              │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -52,23 +54,24 @@
 | Component              | Responsibility                                         |
 |------------------------|--------------------------------------------------------|
 | `VncApplication`       | Entry point. Disables AWT headless mode for Swing.     |
-| `SwingApp`             | SmartLifecycle (phase 0). Creates JFrame on EDT.       |
+| `SwingApp`             | SmartLifecycle (phase 0). Creates JFrame on EDT with CardLayout for page switching. |
 | `AnimatedPanel`        | 60 FPS Swing Timer animation with bouncing balls.      |
-| `CaptureService`       | SmartLifecycle (phase 1). 30 FPS scheduled capture, tile diffing, JPEG encoding. |
-| `BroadcastService`     | Client session registry. Serializes once, sends to all via virtual threads. |
+| `LoadingPanel`         | Spinning arc loader animation with "Loading..." label. |
+| `CaptureService`       | SmartLifecycle (phase 1). 30 FPS scheduled capture, tile diffing, JPEG encoding, binary frame assembly. |
+| `BroadcastService`     | Client session registry. Sends binary frames for screen data, JSON text for lock status, via virtual threads. |
 | `ControlLockService`   | Single-controller lock via CAS on AtomicReference.     |
 | `RemoteControlService` | `getSnapshot()`, `click(x,y)`, `press(key)`. EDT-safe. |
-| `VncWebSocketHandler`  | WSS endpoint. Routes incoming messages, manages connect/disconnect lifecycle. |
+| `VncWebSocketHandler`  | WSS endpoint. Routes incoming text messages, manages connect/disconnect lifecycle. |
 | `WebSocketConfig`      | Registers `/ws` handler. Sets buffer and timeout limits.|
-| `JpegCodec`            | Stateless JPEG encoder with configurable quality.      |
+| `JpegCodec`            | TurboJPEG native encoder (via JNA) with automatic ImageIO fallback. |
 
 ### Frontend
 
 | Component              | Responsibility                                         |
 |------------------------|--------------------------------------------------------|
 | `AppComponent`         | Top-level layout. Connection status, lock button.      |
-| `VncCanvasComponent`   | Canvas renderer. Tile patching, double-buffered full frames, click/key forwarding. |
-| `VncService`           | WebSocket lifecycle, auto-reconnect, Angular signals for reactive state. |
+| `VncCanvasComponent`   | Canvas renderer. Tile patching via `createImageBitmap`, double-buffered full frames, click/key forwarding. |
+| `VncService`           | WebSocket lifecycle, binary frame parsing, auto-reconnect, Angular signals for reactive state. |
 
 ## Data Flow
 
@@ -88,11 +91,15 @@ CaptureService.captureAndBroadcast() — scheduled every 33ms
     ├── If >40% changed OR forced interval → full frame (encode all 920 tiles)
     │   Otherwise → diff frame (encode only changed tiles)
     │
-    ├── JPEG encode each tile at quality 0.6 → Base64 string
+    ├── JPEG encode each tile at quality 0.6
+    │   └── TurboJPEG via JNA (or ImageIO fallback) → raw byte[]
     │
-    └── BroadcastService.broadcast(FrameMessage, isFull)
+    ├── buildBinaryFrame() → pack all tiles into compact binary format
+    │   └── [flags][tileCount][col|row|jpegLen|jpegBytes]...
+    │
+    └── BroadcastService.broadcastFrame(byte[], isFull)
         │
-        ├── Serialize to JSON once (shared across all clients)
+        ├── Wrap in BinaryMessage once (shared across all clients)
         ├── Cache if full frame (for new client init)
         │
         └── For each client:
@@ -101,13 +108,30 @@ CaptureService.captureAndBroadcast() — scheduled every 33ms
                 └── finally: inFlight.set(false)
 ```
 
+### Client Frame Receive
+
+```
+WebSocket binary message (ArrayBuffer)
+    │
+    ├── VncService.handleBinaryFrame()
+    │   ├── DataView: read flags, tileCount from header
+    │   └── For each tile: read col, row, jpegLen, slice Uint8Array
+    │
+    ▼
+VncCanvasComponent.renderFrame()
+    │
+    ├── Diff: for each tile → createImageBitmap(Blob) → drawImage()
+    │
+    └── Full: decode all tiles to offscreen canvas → blit atomically
+```
+
 ### Control Pipeline (Client → Server)
 
 ```
 Browser canvas click/keydown
     │
     ├── VncService.sendClick(x, y) / sendKey(key)
-    │   └── WebSocket.send(JSON)
+    │   └── WebSocket.send(JSON text)
     │
     ▼
 VncWebSocketHandler.handleTextMessage()
@@ -122,12 +146,12 @@ VncWebSocketHandler.handleTextMessage()
 ### Lock Protocol
 
 ```
-Client sends:   { "type": "lock" }
+Client sends:   { "type": "lock" }  (text frame)
     │
     ▼
 Server: controlLockService.tryLock(sessionId)  — CAS(null → sessionId)
     │
-    ├── Success → broadcast lockStatus to ALL clients
+    ├── Success → broadcast lockStatus (text JSON) to ALL clients
     │             (each gets personalized { you: true/false })
     │
     └── Failure → no response (another client holds the lock)

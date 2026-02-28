@@ -79,7 +79,7 @@ export class VncCanvasComponent implements OnInit, AfterViewInit, OnDestroy {
     for (const tile of msg.tiles) {
       const dx = tile.x * this.TILE_SIZE;
       const dy = tile.y * this.TILE_SIZE;
-      this.decodeTile(tile.data).then(bitmap => {
+      this.decodeTile(tile.jpeg).then(bitmap => {
         this.ctx.drawImage(bitmap, dx, dy);
         bitmap.close();
       });
@@ -92,7 +92,7 @@ export class VncCanvasComponent implements OnInit, AfterViewInit, OnDestroy {
     const draws = msg.tiles.map(tile => {
       const dx = tile.x * this.TILE_SIZE;
       const dy = tile.y * this.TILE_SIZE;
-      return this.decodeTile(tile.data).then(bitmap => {
+      return this.decodeTile(tile.jpeg).then(bitmap => {
         this.offCtx.drawImage(bitmap, dx, dy);
         bitmap.close();
       });
@@ -103,13 +103,8 @@ export class VncCanvasComponent implements OnInit, AfterViewInit, OnDestroy {
     });
   }
 
-  private decodeTile(base64: string): Promise<ImageBitmap> {
-    const binStr = atob(base64);
-    const bytes = new Uint8Array(binStr.length);
-    for (let i = 0; i < binStr.length; i++) {
-      bytes[i] = binStr.charCodeAt(i);
-    }
-    return createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
+  private decodeTile(jpeg: Uint8Array): Promise<ImageBitmap> {
+    return createImageBitmap(new Blob([jpeg], { type: 'image/jpeg' }));
   }
 
   onClick(event: MouseEvent): void {

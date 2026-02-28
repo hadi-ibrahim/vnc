@@ -3,22 +3,19 @@ import { Injectable, signal } from '@angular/core';
 export interface TileData {
   x: number;
   y: number;
-  data: string;
+  jpeg: Uint8Array;
 }
 
 export interface FrameMessage {
-  type: 'frame';
   full: boolean;
   tiles: TileData[];
 }
 
-export interface LockStatusMessage {
+interface LockStatusMessage {
   type: 'lockStatus';
   locked: boolean;
   you: boolean;
 }
-
-type ServerMessage = FrameMessage | LockStatusMessage;
 
 @Injectable({ providedIn: 'root' })
 export class VncService {
@@ -37,6 +34,7 @@ export class VncService {
     const url = `${protocol}//${location.host}/ws`;
 
     const ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => {
       this.connected.set(true);
@@ -54,11 +52,16 @@ export class VncService {
     ws.onerror = () => ws.close();
 
     ws.onmessage = (event: MessageEvent) => {
-      try {
-        const msg: ServerMessage = JSON.parse(event.data);
-        this.handleMessage(msg);
-      } catch {
-        // ignore malformed messages
+      if (event.data instanceof ArrayBuffer) {
+        this.handleBinaryFrame(event.data);
+      } else {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'lockStatus') {
+            this.isLocked.set(msg.locked);
+            this.isController.set(msg.you);
+          }
+        } catch { /* ignore malformed text */ }
       }
     };
 
@@ -99,18 +102,34 @@ export class VncService {
     }
   }
 
-  private handleMessage(msg: ServerMessage): void {
-    switch (msg.type) {
-      case 'frame':
-        this.frameCallback?.(msg as FrameMessage);
-        break;
-      case 'lockStatus': {
-        const lock = msg as LockStatusMessage;
-        this.isLocked.set(lock.locked);
-        this.isController.set(lock.you);
-        break;
-      }
+  /**
+   * Binary frame layout:
+   *   [0]      uint8   flags (bit 0 = full)
+   *   [1-2]    uint16  tile count (BE)
+   *   Per tile:
+   *     [0]    uint8   col
+   *     [1]    uint8   row
+   *     [2-5]  uint32  jpeg length (BE)
+   *     [6..]  raw jpeg bytes
+   */
+  private handleBinaryFrame(buffer: ArrayBuffer): void {
+    const view = new DataView(buffer);
+    const full = (view.getUint8(0) & 1) !== 0;
+    const tileCount = view.getUint16(1, false);
+
+    const tiles: TileData[] = [];
+    let offset = 3;
+
+    for (let i = 0; i < tileCount; i++) {
+      const x = view.getUint8(offset);
+      const y = view.getUint8(offset + 1);
+      const jpegLen = view.getUint32(offset + 2, false);
+      const jpeg = new Uint8Array(buffer, offset + 6, jpegLen);
+      tiles.push({ x, y, jpeg });
+      offset += 6 + jpegLen;
     }
+
+    this.frameCallback?.({ full, tiles });
   }
 
   private cleanup(): void {

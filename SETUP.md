@@ -2,17 +2,18 @@
 
 ## Prerequisites
 
-| Tool       | Version  | Check              |
-|------------|----------|--------------------|
-| Java (JDK) | 21+     | `java -version`    |
-| Gradle     | 8.10+   | `gradle -v`        |
-| Node.js    | 20+     | `node -v`          |
-| npm        | 10+     | `npm -v`           |
+| Tool         | Version  | Check              | Required |
+|--------------|----------|--------------------|----------|
+| Java (JDK)   | 21+     | `java -version`    | Yes      |
+| Gradle       | 8.10+   | `gradle -v`        | Yes      |
+| Node.js      | 20+     | `node -v`          | Yes      |
+| npm          | 10+     | `npm -v`           | Yes      |
+| libjpeg-turbo| any     | `ls /opt/homebrew/lib/libturbojpeg*` | Optional (recommended) |
 
 ### macOS (Homebrew)
 
 ```bash
-brew install openjdk@21 gradle node
+brew install openjdk@21 gradle node jpeg-turbo
 ```
 
 If `openjdk@21` is keg-only, export it:
@@ -22,6 +23,26 @@ export JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
 ```
 
 Add this to `~/.zshrc` to persist across sessions.
+
+### TurboJPEG (optional)
+
+The backend uses **TurboJPEG** (via JNA) for hardware-accelerated JPEG encoding, providing a 2-6x speedup over the default `javax.imageio`. If `libturbojpeg` is not found, the application falls back to ImageIO automatically.
+
+```bash
+# macOS
+brew install jpeg-turbo
+
+# Debian/Ubuntu
+sudo apt install libturbojpeg0-dev
+
+# RHEL/Fedora
+sudo dnf install libjpeg-turbo-devel
+```
+
+Check the application logs at startup to confirm:
+```
+INFO  c.v.util.JpegCodec - TurboJPEG native acceleration enabled
+```
 
 ---
 
@@ -72,9 +93,9 @@ This will:
 ```
 
 The backend starts on **`https://localhost:8443`** with:
-- A Swing JFrame (1280x720) with animated bouncing balls
+- A Swing JFrame (1280x720) with two pages: animated bouncing balls and a loading spinner
 - A WSS WebSocket endpoint at `/ws`
-- 30 FPS tile-based screen capture and broadcast
+- 30 FPS tile-based screen capture broadcast using binary WebSocket frames
 
 ### 3. Verify
 
@@ -164,11 +185,11 @@ Then open **`http://localhost:4200`** in one or more browser tabs.
 
 ### WebSocket Limits (`WebSocketConfig`)
 
-| Setting                     | Value    | Description                  |
-|-----------------------------|----------|------------------------------|
-| Max text message buffer     | 2 MB     | Accommodates full-frame JSON |
-| Max binary message buffer   | 2 MB     | Safety margin                |
-| Max session idle timeout    | 1 hour   | Keep-alive for viewers       |
+| Setting                     | Value    | Description                              |
+|-----------------------------|----------|------------------------------------------|
+| Max text message buffer     | 2 MB     | For lock status JSON                     |
+| Max binary message buffer   | 2 MB     | Accommodates full-frame binary (~920 tiles) |
+| Max session idle timeout    | 1 hour   | Keep-alive for viewers                   |
 
 ---
 

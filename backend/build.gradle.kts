@@ -19,6 +19,7 @@ repositories {
 
 dependencies {
     implementation("org.springframework.boot:spring-boot-starter-websocket")
+    implementation("net.java.dev.jna:jna:5.14.0")
 }
 
 tasks.register<Exec>("generateKeystore") {

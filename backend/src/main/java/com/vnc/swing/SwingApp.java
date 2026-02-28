@@ -10,8 +10,13 @@ import java.lang.reflect.InvocationTargetException;
 @Component
 public class SwingApp implements SmartLifecycle {
 
+    private static final String PAGE_MAIN = "main";
+    private static final String PAGE_LOADING = "loading";
+
     private volatile JFrame frame;
     private volatile boolean running;
+    private CardLayout cardLayout;
+    private JPanel cardContainer;
 
     @Override
     public void start() {
@@ -30,14 +35,21 @@ public class SwingApp implements SmartLifecycle {
         frame = new JFrame("VNC Streaming Demo");
         frame.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         frame.setResizable(false);
-        frame.setLayout(new BorderLayout());
+
+        cardLayout = new CardLayout();
+        cardContainer = new JPanel(cardLayout);
 
         AnimatedPanel animatedPanel = new AnimatedPanel();
-        frame.add(animatedPanel, BorderLayout.CENTER);
+        JPanel mainPage = new JPanel(new BorderLayout());
+        mainPage.add(animatedPanel, BorderLayout.CENTER);
+        mainPage.add(buildControlPanel(animatedPanel), BorderLayout.SOUTH);
 
-        JPanel controlPanel = buildControlPanel(animatedPanel);
-        frame.add(controlPanel, BorderLayout.SOUTH);
+        LoadingPanel loadingPage = new LoadingPanel();
 
+        cardContainer.add(mainPage, PAGE_MAIN);
+        cardContainer.add(loadingPage, PAGE_LOADING);
+
+        frame.setContentPane(cardContainer);
         frame.getContentPane().setPreferredSize(new Dimension(1280, 720));
         frame.pack();
         frame.setLocationRelativeTo(null);
@@ -58,6 +70,10 @@ public class SwingApp implements SmartLifecycle {
         JButton speedBtn = styledButton("Toggle Speed");
         speedBtn.addActionListener(e -> animatedPanel.toggleSpeed());
 
+        JButton loadingBtn = styledButton("Loading Page");
+        loadingBtn.setBackground(new Color(130, 90, 180));
+        loadingBtn.addActionListener(e -> showPage(PAGE_LOADING));
+
         JTextField textField = new JTextField("Hello VNC!", 20);
         textField.setFont(new Font("SansSerif", Font.PLAIN, 14));
         textField.setBackground(new Color(60, 60, 60));
@@ -70,6 +86,7 @@ public class SwingApp implements SmartLifecycle {
         panel.add(colorBtn);
         panel.add(resetBtn);
         panel.add(speedBtn);
+        panel.add(loadingBtn);
         panel.add(textField);
         return panel;
     }
@@ -84,6 +101,10 @@ public class SwingApp implements SmartLifecycle {
         btn.setOpaque(true);
         btn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         return btn;
+    }
+
+    public void showPage(String name) {
+        SwingUtilities.invokeLater(() -> cardLayout.show(cardContainer, name));
     }
 
     public JFrame getFrame() {
