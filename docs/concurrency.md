@@ -3,32 +3,42 @@
 ## Thread Topology
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    JVM Threads                       │
-│                                                     │
-│  ┌──────────────────────┐                           │
-│  │ EDT (AWT EventQueue) │ ← Swing Timer (16ms)      │
-│  │                      │ ← invokeAndWait (capture)  │
-│  │                      │ ← invokeLater (click/key)  │
-│  └──────────────────────┘                           │
-│                                                     │
-│  ┌──────────────────────┐                           │
-│  │ vnc-capture (daemon) │ ← ScheduledExecutorService │
-│  │ single platform thd  │   scheduleAtFixedRate 50ms │
-│  └──────────────────────┘                           │
-│                                                     │
-│  ┌──────────────────────┐                           │
-│  │ Virtual threads      │ ← newVirtualThreadPerTask  │
-│  │ (send executor)      │   one per in-flight send   │
-│  │ max ~20 concurrent   │   bounded by inFlight CAS  │
-│  └──────────────────────┘                           │
-│                                                     │
-│  ┌──────────────────────┐                           │
-│  │ Tomcat NIO threads   │ ← WebSocket I/O            │
-│  │ (platform threads)   │   handleTextMessage()      │
-│  └──────────────────────┘                           │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                       JVM Threads                            │
+│                                                             │
+│  ┌──────────────────────────┐                               │
+│  │ EDT (AWT EventQueue)     │ ← Swing Timer (16ms) per app  │
+│  │                          │ ← invokeAndWait (capture)      │
+│  │                          │ ← invokeLater (click/key)      │
+│  └──────────────────────────┘                               │
+│                                                             │
+│  ┌──────────────────────────┐                               │
+│  │ app-1-capture (daemon)   │ ← ScheduledExecutorService    │
+│  │ app-2-capture (daemon)   │   scheduleAtFixedRate 50ms    │
+│  │ app-3-capture (daemon)   │   one thread per app          │
+│  └──────────────────────────┘                               │
+│                                                             │
+│  ┌──────────────────────────┐                               │
+│  │ Virtual threads          │ ← newVirtualThreadPerTask     │
+│  │ (send executors)         │   per-app broadcast service   │
+│  │ max ~20 per app          │   bounded by inFlight CAS     │
+│  └──────────────────────────┘                               │
+│                                                             │
+│  ┌──────────────────────────┐                               │
+│  │ Tomcat NIO threads       │ ← WebSocket I/O               │
+│  │ (platform threads)       │   handleTextMessage()          │
+│  └──────────────────────────┘                               │
+└─────────────────────────────────────────────────────────────┘
 ```
+
+## Multi-App Thread Isolation
+
+Each `AppInstance` owns its own:
+- **Capture thread** — Named `app-{id}-capture`, runs as a single daemon thread via `ScheduledExecutorService`
+- **Send executor** — `Executors.newVirtualThreadPerTaskExecutor()` for broadcasting frames to its clients
+- **BroadcastService** — Independent client registry and in-flight tracking
+
+The **EDT is shared** across all apps (Swing has a single event dispatch thread). All Swing operations (`invokeAndWait`, `invokeLater`) serialize on the EDT. Capture threads from different apps may contend briefly on the EDT, but `invokeAndWait` calls are short (a single `paint()` into a `BufferedImage`).
 
 ## Thread Safety Analysis
 
@@ -38,47 +48,39 @@ All Swing component access is confined to the EDT:
 
 | Operation                   | Thread             | Mechanism              |
 |-----------------------------|--------------------|------------------------|
-| JFrame creation             | EDT                | `invokeAndWait()` in `SwingApp.start()` |
+| JFrame creation (per app)   | EDT                | `invokeAndWait()` in `SwingApp.start()` |
 | Animation tick + repaint    | EDT                | `javax.swing.Timer` (fires on EDT)      |
 | Frame capture (paint)       | EDT                | `invokeAndWait()` from capture thread   |
 | Click dispatch              | EDT                | `invokeLater()` from Tomcat NIO thread  |
 | Key dispatch                | EDT                | `invokeLater()` from Tomcat NIO thread  |
 | JFrame disposal             | EDT                | `invokeLater()` in `SwingApp.stop()`    |
 
-The `SwingApp.frame` field is `volatile`, ensuring visibility from the capture thread and Tomcat threads that read it.
+Each `SwingApp.frame` field is `volatile`, ensuring visibility from capture threads and Tomcat threads.
 
 ### H264EncoderService
 
-The encoder is **single-threaded by design** — only called from the `vnc-capture` thread within the `CaptureService` capture loop. All public methods are `synchronized` as a safety net, but contention never occurs in practice.
+Each app has its own encoder, called only from that app's capture thread. All public methods are `synchronized` as a safety net, but contention never occurs in practice since each encoder is single-caller.
 
-Native FFmpeg resources (`AVCodecContext`, `SwsContext`, `AVFrame`, `AVPacket`) are allocated once at `start()` and freed at `stop()`. They are never accessed concurrently.
+### AppInstance Capture Loop
 
-The Annex B → AVCC conversion methods are stateless and thread-safe.
-
-### CaptureService
-
-The capture loop runs on a single daemon thread (`vnc-capture`). Concurrent re-entry is prevented by `AtomicBoolean capturing`:
+Each app's capture loop runs on its own daemon thread. Concurrent re-entry is prevented by `AtomicBoolean capturing`:
 
 ```java
 if (!capturing.compareAndSet(false, true)) return;
 try {
-    // ... capture logic ...
+    // ... capture + encode + broadcast ...
 } finally {
     capturing.set(false);
 }
 ```
 
-The `captureBuffer` (`BufferedImage`) is only written to inside the `capturing` guard, which is single-threaded. The encoded `byte[]` is immutable once constructed and safely shared with virtual send threads.
-
 ### BroadcastService
 
-**Client registry:** `ConcurrentHashMap<String, ClientSession>` provides safe concurrent iteration during broadcast while Tomcat threads add/remove clients.
+Each app has its own `BroadcastService` with its own `ConcurrentHashMap<String, ClientSession>`.
 
-**Frame serialization:** H.264 encoded bytes are packed into a binary frame (5-byte header + payload) once on the capture thread. The resulting `BinaryMessage` wraps an immutable `byte[]` and is safely shared across virtual send threads.
+**Frame serialization:** Built once on the capture thread. The `BinaryMessage` wraps an immutable `byte[]` shared across virtual send threads.
 
-**Codec config + keyframe caching:** Both are stored as `volatile BinaryMessage` fields. The capture thread writes them; virtual send threads and Tomcat threads (in `addClient`) read them. Volatile ensures visibility.
-
-**Per-client send:** Each `ClientSession` has an `AtomicBoolean inFlight`:
+**Per-client send:** `AtomicBoolean inFlight` per client session:
 
 ```
 Capture thread:                     Virtual send thread:
@@ -92,53 +94,51 @@ Capture thread:                     Virtual send thread:
   │                                   │
 ```
 
-The `synchronized(session)` block prevents overlapping writes to the same WebSocket session from `broadcastFrame()` and `sendTo()` (used for lock status text messages).
+### VncWebSocketHandler
+
+The handler maintains a `ConcurrentMap<String, AppInstance>` mapping session IDs to their app. This map is:
+- **Written to** on connection (Tomcat NIO thread)
+- **Read from** on every message (Tomcat NIO thread)
+- **Removed from** on disconnect (Tomcat NIO thread)
+
+The `ConcurrentHashMap` provides safe concurrent access.
 
 ### ControlLockService
 
-All operations use `AtomicReference.compareAndSet()`:
-
-```java
-// Lock:   CAS(null → sessionId)     — only succeeds if unlocked
-// Unlock: CAS(sessionId → null)     — only succeeds if this session holds it
-// Check:  sessionId.equals(ref.get()) — non-blocking read
-```
-
-This is lock-free and linearizable. No mutex contention under load.
+Per-app lock via `AtomicReference<String>`. Lock-free and linearizable.
 
 ## Memory Safety
 
 ### Bounded Queues
 
-| Component            | Queue Type                        | Bound                          |
-|----------------------|-----------------------------------|--------------------------------|
-| Capture scheduler    | `ScheduledExecutorService`        | Single thread, fixed rate      |
-| Send executor        | Virtual thread per task           | Bounded by `inFlight` CAS — max 1 task per client |
-| WebSocket buffers    | Tomcat internal                   | 2 MB per session (configured)  |
+| Component                 | Queue Type                        | Bound                          |
+|---------------------------|-----------------------------------|--------------------------------|
+| Capture scheduler (×3)    | `ScheduledExecutorService`        | Single thread per app          |
+| Send executor (×3)        | Virtual thread per task           | Bounded by `inFlight` CAS     |
+| WebSocket buffers         | Tomcat internal                   | 2 MB per session               |
 
 ### Object Lifetimes
 
 | Object              | Scope                              | GC Eligible When                |
 |---------------------|------------------------------------|---------------------------------|
-| `BufferedImage` (captureBuffer) | CaptureService field    | Service shutdown               |
-| `byte[]` H.264 packet          | Per-capture             | After all virtual sends finish |
-| `BinaryMessage` (cachedKeyframe)| `volatile` field       | Replaced by next keyframe      |
-| `BinaryMessage` (cachedCodecConfig)| `volatile` field    | Replaced if encoder restarts   |
-| `ClientSession`                | ConcurrentHashMap entry | `removeClient()` call          |
-| FFmpeg native resources        | H264EncoderService fields | `stop()` call               |
+| `AppInstance`       | `AppRegistry` map entry            | `AppRegistry.stop()`            |
+| `BufferedImage` (×3)| `AppInstance` field                | App shutdown                    |
+| `byte[]` H.264 packet | Per-capture per app              | After all virtual sends finish  |
+| `BinaryMessage` (cached) | Per-app `volatile` field       | Replaced by next keyframe       |
+| `ClientSession`     | Per-app `ConcurrentHashMap` entry  | `removeClient()` call           |
+| FFmpeg native resources | Per-app `H264EncoderService`   | `stop()` call                   |
 
 ### No Unbounded Growth
 
-- H.264 encoded bytes are allocated per-capture and become garbage after broadcast completes.
-- The `cachedKeyframe` holds exactly one `BinaryMessage` at a time.
-- The `cachedCodecConfig` holds exactly one `BinaryMessage` at a time.
-- Virtual threads are short-lived (one send operation) and exit promptly.
-- `ConcurrentHashMap` entries are bounded by the number of connected clients (~20 max).
-- FFmpeg native memory (`AVFrame`, `AVPacket`) is pre-allocated and reused across frames — no per-frame native allocation.
+- Each app's encoded bytes are allocated per-capture and become garbage after broadcast.
+- Each app caches exactly one keyframe and one codec config message.
+- Virtual threads are short-lived (one send) and exit promptly.
+- Client sessions per app are bounded by connected viewers.
+- FFmpeg native memory is pre-allocated per app and reused across frames.
 
 ### Native Resource Management
 
-The `H264EncoderService` allocates native FFmpeg resources via JavaCV:
+Each `AppInstance` has its own `H264EncoderService` with its own native FFmpeg resources:
 
 | Resource           | Allocated          | Freed                    |
 |--------------------|--------------------|--------------------------|
@@ -148,4 +148,4 @@ The `H264EncoderService` allocates native FFmpeg resources via JavaCV:
 | `AVFrame` (yuv)    | `start()`          | `av_frame_free()` in `stop()`        |
 | `AVPacket`         | `start()`          | `av_packet_free()` in `stop()`       |
 
-All native resources are freed in `stop()`, which is called by `CaptureService.stop()` during Spring context shutdown. The `synchronized` keyword on `stop()` prevents concurrent access during shutdown.
+All native resources are freed in `AppInstance.stop()`, called by `AppRegistry.stop()` during Spring context shutdown.

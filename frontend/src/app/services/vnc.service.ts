@@ -18,16 +18,18 @@ export class VncService {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private frameCallback: ((frame: H264Frame) => void) | null = null;
   private configCallback: ((config: Uint8Array) => void) | null = null;
+  private currentAppId: string | null = null;
 
   readonly connected = signal(false);
   readonly isController = signal(false);
   readonly isLocked = signal(false);
 
-  connect(): void {
+  connect(appId: string): void {
     this.cleanup();
+    this.currentAppId = appId;
 
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${protocol}//${location.host}/ws`;
+    const url = `${protocol}//${location.host}/ws/${appId}`;
 
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
@@ -61,6 +63,7 @@ export class VncService {
   disconnect(): void {
     this.clearReconnect();
     this.cleanup();
+    this.currentAppId = null;
     this.connected.set(false);
     this.isController.set(false);
     this.isLocked.set(false);
@@ -141,8 +144,10 @@ export class VncService {
   }
 
   private scheduleReconnect(): void {
+    if (this.currentAppId == null) return;
     this.clearReconnect();
-    this.reconnectTimer = setTimeout(() => this.connect(), 2000);
+    const appId = this.currentAppId;
+    this.reconnectTimer = setTimeout(() => this.connect(appId), 2000);
   }
 
   private clearReconnect(): void {

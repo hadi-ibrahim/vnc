@@ -4,6 +4,7 @@
 
 - **Angular 19.2** (standalone components, signals, zone.js)
 - **TypeScript 5.7**
+- **Angular Router** (path-based routing for screen manager + viewer)
 - **Native WebSocket API** (no RxJS WebSocket wrapper)
 - **WebCodecs API** (`VideoDecoder`) for hardware-accelerated H.264 decoding
 - **Canvas 2D API** for video frame rendering
@@ -12,40 +13,84 @@
 
 ```
 frontend/src/app/
-├── app.component.ts            # Root component (layout + lock button)
-├── app.component.html          # Root template
-├── app.component.css           # Root styles
-├── app.config.ts               # Application bootstrap config
+├── app.component.ts            # Root component (router outlet shell)
+├── app.config.ts               # Application bootstrap config (provideRouter)
+├── app.routes.ts               # Route definitions
 ├── services/
 │   └── vnc.service.ts          # WebSocket + H.264 frame parsing + state
 └── components/
+    ├── screen-manager/
+    │   └── screen-manager.component.ts  # App selection grid (fetches /api/apps)
+    ├── viewer/
+    │   └── viewer.component.ts          # VNC viewer page (header + canvas)
     └── vnc-canvas/
-        └── vnc-canvas.component.ts  # WebCodecs decoder + canvas renderer + input forwarding
+        └── vnc-canvas.component.ts      # WebCodecs decoder + canvas renderer
 ```
+
+---
+
+## Routing
+
+Defined in `app.routes.ts`:
+
+| Path         | Component              | Description                           |
+|--------------|------------------------|---------------------------------------|
+| `/`          | `ScreenManagerComponent` | Lists available apps from backend   |
+| `/app/:id`   | `ViewerComponent`      | Streams the selected app             |
+
+`AppComponent` is a minimal shell containing only `<router-outlet />`.
 
 ---
 
 ## Components
 
-### `AppComponent`
+### `ScreenManagerComponent`
 
-The root shell. Provides the header bar with connection status and lock control.
+The landing page. Fetches the list of available apps from `GET /api/apps` and displays them as a responsive grid of clickable cards.
 
-**Template bindings:**
+**Lifecycle:**
+
+| Phase       | Action                                            |
+|-------------|---------------------------------------------------|
+| `ngOnInit`  | Fetches `/api/apps`, populates `apps` signal      |
+| Template    | Renders a card for each app with a `[routerLink]` to `/app/{id}` |
+
+**Signals:**
+
+| Signal    | Type            | Description                           |
+|-----------|-----------------|---------------------------------------|
+| `apps`    | `AppInfo[]`     | Array of `{id, name}` from backend    |
+| `loading` | `boolean`       | `true` while fetching, `false` after  |
+
+**Interface:**
+```typescript
+interface AppInfo {
+  id: string;
+  name: string;
+}
+```
+
+---
+
+### `ViewerComponent`
+
+The VNC viewer page for a specific app. Wraps the canvas component with a header bar.
+
+**Lifecycle:**
+
+| Phase        | Action                                             |
+|--------------|----------------------------------------------------|
+| `ngOnInit`   | Reads `:id` from route, calls `vnc.connect(id)`   |
+| `ngOnDestroy` | Calls `vnc.disconnect()`                          |
+
+**Template elements:**
 
 | Element              | Binding                            | Description                          |
 |----------------------|------------------------------------|--------------------------------------|
+| Back button          | `routerLink="/"`                   | Returns to screen manager            |
 | Status pill          | `vnc.connected()`                  | Green/red connection indicator       |
-| Lock button text     | `vnc.isController()`              | "Take Control" / "Release Control"   |
-| Lock button disabled | `!connected \|\| (locked && !you)` | Disabled when disconnected or another client holds the lock |
-
-**Methods:**
-
-| Method         | Description                                      |
-|----------------|--------------------------------------------------|
-| `ngOnInit()`   | Calls `vnc.connect()` to establish WebSocket      |
-| `ngOnDestroy()`| Calls `vnc.disconnect()` to clean up              |
-| `toggleLock()` | Sends lock or unlock based on current state       |
+| Lock button          | `vnc.isController()`              | "Take Control" / "Release Control"   |
+| Canvas               | `<app-vnc-canvas>`                | Embedded VNC canvas component        |
 
 ---
 
@@ -65,33 +110,21 @@ Codec config (Uint8Array)
     │
     ▼
 VideoDecoder.configure({
-    codec: 'avc1.42001e',       // H.264 Baseline Level 3.0
+    codec: 'avc1.42001e',
     codedWidth: 1280,
     codedHeight: 720,
-    description: spsAndPps      // AVCC format from server
+    description: spsAndPps
 })
     │
     ▼
-H.264 frame (Uint8Array) → EncodedVideoChunk
-    │                          type: 'key' | 'delta'
-    │                          timestamp: microseconds
-    ▼
-VideoDecoder.decode(chunk)
+H.264 frame → EncodedVideoChunk → VideoDecoder.decode()
     │
     ▼
 output callback: (frame: VideoFrame) => {
-    ctx.drawImage(frame, 0, 0)  // Canvas 2D natively accepts VideoFrame
-    frame.close()               // Release GPU memory
+    ctx.drawImage(frame, 0, 0)
+    frame.close()
 }
 ```
-
-**Decoder lifecycle:**
-
-1. On receiving a codec config message (first byte 0xFF), the component stores the AVCC data and calls `initDecoder()`
-2. `initDecoder()` creates a new `VideoDecoder` with output/error callbacks, then calls `configure()` with the codec string and description
-3. Any keyframes received before the decoder is configured are buffered in `pendingFrames` and flushed after configuration
-4. Each H.264 frame is wrapped in an `EncodedVideoChunk` and fed to `decode()`
-5. On disconnect or component destruction, the decoder is closed to free resources
 
 **Input forwarding:**
 
@@ -99,12 +132,6 @@ output callback: (frame: VideoFrame) => {
 |-----------|-----------------|-----------------------------------------------|
 | `click`   | Is controller   | Scale canvas coords to 1280×720, send `click` |
 | `keydown` | Is controller   | If `key.length === 1`, send `key`             |
-
-Coordinate scaling accounts for CSS-based canvas resizing:
-```typescript
-const scaleX = 1280 / rect.width;
-const scaleY = 720 / rect.height;
-```
 
 ---
 
@@ -122,69 +149,35 @@ Singleton service (`providedIn: 'root'`) managing WebSocket lifecycle and applic
 | `isController`  | `boolean` | This client holds the control lock        |
 | `isLocked`      | `boolean` | Any client holds the control lock         |
 
-Signals integrate with Angular's change detection — template bindings update automatically without manual subscriptions or `OnPush` workarounds.
+**`connect(appId: string)`**
 
-**WebSocket Lifecycle:**
-
-```
-connect()
-  │
-  ├── cleanup() — close existing connection, clear handlers
-  ├── new WebSocket(url)
-  ├── ws.binaryType = 'arraybuffer'
-  │
-  ├── onopen  → connected.set(true), clearReconnect()
-  ├── onclose → connected.set(false), scheduleReconnect()
-  ├── onerror → ws.close()  (triggers onclose)
-  └── onmessage:
-        ├── event.data instanceof ArrayBuffer → handleBinaryMessage()
-        └── otherwise → handleTextMessage() for lockStatus
-```
-
-**Binary message parsing (`handleBinaryMessage`):**
-
-Distinguishes message types by the first byte:
-
-| First byte | Message type     | Action                              |
-|------------|------------------|-------------------------------------|
-| `0xFF`     | Codec config     | Extract bytes [1..], invoke `configCallback` |
-| Other      | H.264 frame      | Parse flags, timestamp, data, invoke `frameCallback` |
-
-Frame parsing:
-1. Read `flags` (uint8) — bit 0 indicates keyframe
-2. Read `timestamp` (uint32 big-endian) — milliseconds from encoder start
-3. Slice remaining bytes as H.264 access unit data
-4. Pass `{ keyframe, timestamp, data }` to the registered frame callback
-
-**Reconnect logic:**
-
-On close, a 2-second timer schedules a new `connect()` call. The timer is cleared on successful open or manual disconnect. Cleanup nullifies all event handlers before closing to prevent the close handler from triggering reconnect during intentional disconnect.
-
-**URL construction:**
+Establishes a WebSocket connection to `ws://host/ws/{appId}`. The `appId` parameter routes the connection to the correct app on the backend.
 
 ```typescript
 const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-const url = `${protocol}//${location.host}/ws`;
+const url = `${protocol}//${location.host}/ws/${appId}`;
 ```
 
-This works in both development (proxied through Angular dev server) and production (same-origin deployment).
+**Reconnect logic:**
 
-**Callbacks:**
+On close, a 2-second timer schedules a new `connect(appId)` call using the stored `currentAppId`. Cleared on successful open or manual disconnect.
 
-| Method                      | Description                                     |
-|-----------------------------|-------------------------------------------------|
-| `onFrame(callback)`         | Register H.264 frame callback                   |
-| `onConfig(callback)`        | Register codec config callback                   |
+**Binary message parsing:**
+
+| First byte | Message type     | Action                              |
+|------------|------------------|-------------------------------------|
+| `0xFF`     | Codec config     | Extract bytes [1..], invoke config callback |
+| Other      | H.264 frame      | Parse flags, timestamp, data, invoke frame callback |
 
 **Public API:**
 
 | Method                      | Description                           |
 |-----------------------------|---------------------------------------|
-| `connect()`                 | Establish WebSocket connection        |
+| `connect(appId)`            | Connect to a specific app             |
 | `disconnect()`              | Close connection, stop reconnect      |
 | `onFrame(callback)`         | Register frame render callback        |
 | `onConfig(callback)`        | Register codec config callback        |
-| `sendClick(x, y)`           | Send click command (rounded coords)   |
+| `sendClick(x, y)`           | Send click command                    |
 | `sendKey(key)`              | Send key command                      |
 | `requestLock()`             | Send lock request                     |
 | `releaseLock()`             | Send unlock request                   |
@@ -201,17 +194,20 @@ export interface LockStatusMessage {
 }
 
 export interface H264Frame {
-  keyframe: boolean;     // true = IDR frame, false = P-frame
-  timestamp: number;     // milliseconds from encoder start
-  data: Uint8Array;      // H.264 access unit (AVCC format)
+  keyframe: boolean;
+  timestamp: number;
+  data: Uint8Array;
+}
+
+interface AppInfo {
+  id: string;
+  name: string;
 }
 ```
 
 ---
 
 ## WebCodecs Browser Support
-
-The frontend requires the **WebCodecs API** for H.264 video decoding:
 
 | Browser        | Minimum Version | Notes                                     |
 |----------------|-----------------|-------------------------------------------|
@@ -221,13 +217,11 @@ The frontend requires the **WebCodecs API** for H.264 video decoding:
 | Firefox        | Behind flag     | `dom.media.webcodecs.enabled`             |
 | Opera          | 80+             | Full support (Chromium-based)             |
 
-The `VideoDecoder` is configured with codec string `'avc1.42001e'` (H.264 Baseline, Level 3.0), which has the broadest hardware decoder support across devices.
-
 ---
 
 ## Development Proxy
 
-`proxy.conf.json` configures the Angular dev server to proxy WebSocket connections:
+`proxy.conf.json` configures the Angular dev server to proxy both WebSocket and REST API requests:
 
 ```json
 {
@@ -236,18 +230,19 @@ The `VideoDecoder` is configured with codec string `'avc1.42001e'` (H.264 Baseli
     "ws": true,
     "secure": false,
     "changeOrigin": true
+  },
+  "/api": {
+    "target": "https://localhost:8443",
+    "secure": false,
+    "changeOrigin": true
   }
 }
 ```
 
-| Option          | Value                     | Purpose                                    |
-|-----------------|---------------------------|--------------------------------------------|
-| `target`        | `https://localhost:8443`  | Backend HTTPS endpoint                     |
-| `ws`            | `true`                    | Proxy WebSocket upgrade requests           |
-| `secure`        | `false`                   | Accept self-signed certificates            |
-| `changeOrigin`  | `true`                    | Rewrite the Host header                    |
-
-With this configuration, the browser connects to `ws://localhost:4200/ws` (the dev server), which transparently proxies to `wss://localhost:8443/ws` (the backend). No self-signed certificate warnings appear in the browser.
+| Route   | Purpose                                      |
+|---------|----------------------------------------------|
+| `/ws`   | Proxies WebSocket upgrade to backend (WSS)   |
+| `/api`  | Proxies REST API calls (app listing)         |
 
 ---
 
@@ -262,6 +257,6 @@ npx ng build
 
 The output in `dist/frontend/browser/` can be:
 
-1. **Served by Spring Boot** — Copy contents to `backend/src/main/resources/static/` and rebuild. The entire app is then served from `https://localhost:8443/`.
-2. **Served by a reverse proxy** (nginx, Caddy) — Proxy `/ws` to the backend, serve static files directly.
+1. **Served by Spring Boot** — Copy contents to `backend/src/main/resources/static/` and rebuild.
+2. **Served by a reverse proxy** (nginx, Caddy) — Proxy `/ws` and `/api` to the backend, serve static files directly.
 3. **Served by any static file server** — The WebSocket URL auto-detects the host via `location.host`.

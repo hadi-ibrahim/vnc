@@ -2,11 +2,28 @@
 
 ## Connection
 
-- **Endpoint:** `wss://localhost:8443/ws`
+- **Endpoint:** `wss://localhost:8443/ws/{appId}` (e.g. `/ws/1`, `/ws/2`, `/ws/3`)
 - **Transport:** WebSocket over TLS (WSS)
 - **Frame encoding:** Binary frames for H.264 video data + codec config, JSON text frames for control messages
 - **Client `binaryType`:** `arraybuffer`
 - **Max message size:** 2 MB
+- **App isolation:** Each WebSocket connection is bound to a specific app. Clients, lock state, and frame broadcasts are scoped to the connected app.
+
+## REST API
+
+### `GET /api/apps`
+
+Returns the list of available apps.
+
+```json
+[
+  { "id": "1", "name": "Bouncing Balls" },
+  { "id": "2", "name": "Bouncing Balls 2" },
+  { "id": "3", "name": "Bouncing Balls 3" }
+]
+```
+
+Used by the frontend Screen Manager to populate the app selection grid.
 
 ## Message Types
 
@@ -60,22 +77,12 @@ Sent as a **WebSocket binary frame** at ~20 FPS. Contains one H.264 access unit 
 | `data`      | `bytes`  | H.264 NAL units in AVCC format (4-byte length prefixed)  |
 
 **Keyframe vs delta:**
-- **Keyframe (IDR):** Self-contained frame that can be decoded independently. Sent every 2 seconds (GOP size = 40 frames at 20 FPS) and cached by the server for new client initialization.
-- **Delta frame (P-frame):** Encodes only differences from the previous frame using motion vectors and residuals. Typically 1-3 KB for screen content with small moving objects.
-
-**Example (hex) — delta frame:**
-```
-00 00 00 1A 2C [payload]   ← flags=0 (delta), timestamp=6700ms, H.264 data
-```
-
-**Example (hex) — keyframe:**
-```
-01 00 00 00 00 [payload]   ← flags=1 (keyframe), timestamp=0ms, H.264 data
-```
+- **Keyframe (IDR):** Self-contained frame. Sent every 2 seconds (GOP size = 40 at 20 FPS) and cached per-app for new client initialization.
+- **Delta frame (P-frame):** Encodes only differences from the previous frame. Typically 1-3 KB.
 
 #### `lockStatus` (JSON Text)
 
-Sent as a **WebSocket text frame** to each client individually when lock state changes, and on initial connection.
+Sent as a **WebSocket text frame** to each client individually when lock state changes, and on initial connection. Scoped to the connected app.
 
 ```json
 {
@@ -88,7 +95,7 @@ Sent as a **WebSocket text frame** to each client individually when lock state c
 | Field    | Type        | Description                                         |
 |----------|-------------|-----------------------------------------------------|
 | `type`   | `"lockStatus"` | Message discriminator                            |
-| `locked` | `boolean`   | `true` if any client currently holds the control lock |
+| `locked` | `boolean`   | `true` if any client holds the lock for this app    |
 | `you`    | `boolean`   | `true` if THIS client is the controller             |
 
 ### Client → Server
@@ -97,7 +104,7 @@ All client-to-server messages are **JSON text frames**.
 
 #### `click`
 
-Simulate a mouse click at the given coordinates.
+Simulate a mouse click at the given coordinates on the connected app's JFrame.
 
 ```json
 {
@@ -107,17 +114,11 @@ Simulate a mouse click at the given coordinates.
 }
 ```
 
-| Field  | Type       | Description                               |
-|--------|------------|-------------------------------------------|
-| `type` | `"click"`  | Message discriminator                     |
-| `x`    | `integer`  | X coordinate (0–1279) in content pane space |
-| `y`    | `integer`  | Y coordinate (0–719) in content pane space  |
-
-Ignored if the sender does not hold the control lock.
+Ignored if the sender does not hold the control lock for this app.
 
 #### `key`
 
-Simulate a key press.
+Simulate a key press on the connected app's JFrame.
 
 ```json
 {
@@ -126,40 +127,27 @@ Simulate a key press.
 }
 ```
 
-| Field  | Type      | Description                                        |
-|--------|-----------|----------------------------------------------------|
-| `type` | `"key"`   | Message discriminator                              |
-| `key`  | `string`  | Single character to type (first char is used)      |
-
-Ignored if the sender does not hold the control lock.
+Ignored if the sender does not hold the control lock for this app.
 
 #### `lock`
 
-Request exclusive control.
+Request exclusive control of the connected app.
 
 ```json
-{
-  "type": "lock"
-}
+{ "type": "lock" }
 ```
 
-Succeeds only if no other client holds the lock. On success, the server broadcasts `lockStatus` to all clients. On failure, no response is sent.
+Succeeds only if no other client holds the lock for this app.
 
 #### `unlock`
 
-Release exclusive control.
+Release exclusive control of the connected app.
 
 ```json
-{
-  "type": "unlock"
-}
+{ "type": "unlock" }
 ```
 
-Succeeds only if the sender currently holds the lock. On success, the server broadcasts `lockStatus` to all clients.
-
 ## Client Message Dispatch
-
-The client distinguishes server messages by WebSocket frame type and first byte:
 
 ```
 ws.onmessage = (event) => {
@@ -178,28 +166,26 @@ ws.onmessage = (event) => {
 ```
 Client                            Server
   │                                  │
-  │──── WebSocket CONNECT ──────────▶│
-  │     (binaryType: arraybuffer)    │ addClient(sessionId)
-  │◀──── lockStatus (text JSON) ────│ (initial lock state)
-  │◀──── codec config (binary) ─────│ (SPS+PPS for decoder init)
-  │◀──── keyframe (binary) ─────────│ (cached, if available)
+  │──── WebSocket CONNECT ──────────▶│  /ws/2
+  │     (binaryType: arraybuffer)    │  extract appId="2"
+  │                                  │  AppRegistry.get("2") → AppInstance
+  │                                  │  addClient(sessionId)
+  │◀──── lockStatus (text JSON) ────│  (initial lock state for app 2)
+  │◀──── codec config (binary) ─────│  (SPS+PPS for app 2's encoder)
+  │◀──── keyframe (binary) ─────────│  (cached, if available)
   │                                  │
-  │◀──── frame (binary, delta) ─────│ (20 FPS H.264 stream)
+  │◀──── frame (binary, delta) ─────│  (20 FPS H.264 stream from app 2)
   │◀──── frame (binary, delta) ─────│
-  │◀──── frame (binary, key) ───────│ (every ~2 seconds)
+  │◀──── frame (binary, key) ───────│  (every ~2 seconds)
   │                                  │
-  │──── { type: "lock" } (text) ───▶│ tryLock(sessionId)
+  │──── { type: "lock" } (text) ───▶│  app2.tryLock(sessionId)
   │◀──── lockStatus (text JSON) ────│
   │                                  │
-  │──── { type: "click" } (text) ──▶│ remoteControlService.click()
-  │──── { type: "key" } (text) ────▶│ remoteControlService.press()
-  │                                  │
-  │──── { type: "unlock" } (text) ─▶│ unlock(sessionId)
-  │◀──── lockStatus (text JSON) ────│
+  │──── { type: "click" } (text) ──▶│  app2.remoteControlService.click()
   │                                  │
   │──── WebSocket CLOSE ────────────▶│
-  │                                  │ removeClient(sessionId)
-  │                                  │ auto-unlock if controller
+  │                                  │  app2.removeClient(sessionId)
+  │                                  │  auto-unlock if controller
 ```
 
 ## Backpressure

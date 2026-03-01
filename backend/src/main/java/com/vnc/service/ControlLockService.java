@@ -1,10 +1,7 @@
 package com.vnc.service;
 
-import org.springframework.stereotype.Service;
-
 import java.util.concurrent.atomic.AtomicReference;
 
-@Service
 public class ControlLockService {
 
     private final AtomicReference<String> controllerId = new AtomicReference<>();

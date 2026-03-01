@@ -3,9 +3,8 @@ package com.vnc.websocket;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.vnc.model.LockStatusMessage;
-import com.vnc.service.BroadcastService;
-import com.vnc.service.ControlLockService;
-import com.vnc.service.RemoteControlService;
+import com.vnc.service.AppInstance;
+import com.vnc.service.AppRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -14,71 +13,84 @@ import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
+import java.net.URI;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+
 @Component
 public class VncWebSocketHandler extends TextWebSocketHandler {
 
     private static final Logger log = LoggerFactory.getLogger(VncWebSocketHandler.class);
 
-    private final BroadcastService broadcastService;
-    private final RemoteControlService remoteControlService;
-    private final ControlLockService controlLockService;
+    private final AppRegistry appRegistry;
     private final ObjectMapper objectMapper;
+    private final ConcurrentMap<String, AppInstance> sessionToApp = new ConcurrentHashMap<>();
 
-    public VncWebSocketHandler(BroadcastService broadcastService,
-                               RemoteControlService remoteControlService,
-                               ControlLockService controlLockService,
-                               ObjectMapper objectMapper) {
-        this.broadcastService = broadcastService;
-        this.remoteControlService = remoteControlService;
-        this.controlLockService = controlLockService;
+    public VncWebSocketHandler(AppRegistry appRegistry, ObjectMapper objectMapper) {
+        this.appRegistry = appRegistry;
         this.objectMapper = objectMapper;
     }
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) {
-        log.info("Client connected: {}", session.getId());
-        broadcastService.addClient(session.getId(), session);
-        sendLockStatusTo(session.getId());
+        String appId = extractAppId(session);
+        AppInstance app = appRegistry.get(appId);
+        if (app == null) {
+            log.warn("Client {} connected to unknown app '{}'", session.getId(), appId);
+            try { session.close(CloseStatus.BAD_DATA); } catch (Exception ignored) {}
+            return;
+        }
+
+        sessionToApp.put(session.getId(), app);
+        log.info("Client {} connected to app '{}'", session.getId(), appId);
+        app.getBroadcastService().addClient(session.getId(), session);
+        sendLockStatusTo(session.getId(), app);
     }
 
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
-        log.info("Client disconnected: {} ({})", session.getId(), status);
-        broadcastService.removeClient(session.getId());
-        if (controlLockService.unlock(session.getId())) {
-            broadcastLockStatusToAll();
+        AppInstance app = sessionToApp.remove(session.getId());
+        if (app == null) return;
+
+        log.info("Client {} disconnected from app '{}' ({})", session.getId(), app.getId(), status);
+        app.getBroadcastService().removeClient(session.getId());
+        if (app.getControlLockService().unlock(session.getId())) {
+            broadcastLockStatusToAll(app);
         }
     }
 
     @Override
     protected void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
+        AppInstance app = sessionToApp.get(session.getId());
+        if (app == null) return;
+
         JsonNode node = objectMapper.readTree(message.getPayload());
         String type = node.has("type") ? node.get("type").asText() : "";
 
         switch (type) {
             case "click" -> {
-                if (controlLockService.isController(session.getId())) {
+                if (app.getControlLockService().isController(session.getId())) {
                     int x = node.get("x").asInt();
                     int y = node.get("y").asInt();
-                    remoteControlService.click(x, y);
+                    app.getRemoteControlService().click(x, y);
                 }
             }
             case "key" -> {
-                if (controlLockService.isController(session.getId())) {
+                if (app.getControlLockService().isController(session.getId())) {
                     String keyStr = node.get("key").asText();
                     if (!keyStr.isEmpty()) {
-                        remoteControlService.press(keyStr.charAt(0));
+                        app.getRemoteControlService().press(keyStr.charAt(0));
                     }
                 }
             }
             case "lock" -> {
-                if (controlLockService.tryLock(session.getId())) {
-                    broadcastLockStatusToAll();
+                if (app.getControlLockService().tryLock(session.getId())) {
+                    broadcastLockStatusToAll(app);
                 }
             }
             case "unlock" -> {
-                if (controlLockService.unlock(session.getId())) {
-                    broadcastLockStatusToAll();
+                if (app.getControlLockService().unlock(session.getId())) {
+                    broadcastLockStatusToAll(app);
                 }
             }
             default -> log.warn("Unknown message type: {}", type);
@@ -90,17 +102,25 @@ public class VncWebSocketHandler extends TextWebSocketHandler {
         log.warn("Transport error for {}: {}", session.getId(), exception.getMessage());
     }
 
-    private void sendLockStatusTo(String sessionId) {
-        boolean locked = controlLockService.isLocked();
-        boolean isController = controlLockService.isController(sessionId);
-        broadcastService.sendTo(sessionId, LockStatusMessage.of(locked, isController));
+    private void sendLockStatusTo(String sessionId, AppInstance app) {
+        boolean locked = app.getControlLockService().isLocked();
+        boolean isController = app.getControlLockService().isController(sessionId);
+        app.getBroadcastService().sendTo(sessionId, LockStatusMessage.of(locked, isController));
     }
 
-    private void broadcastLockStatusToAll() {
-        boolean locked = controlLockService.isLocked();
-        for (String id : broadcastService.getClientIds()) {
-            boolean isController = controlLockService.isController(id);
-            broadcastService.sendTo(id, LockStatusMessage.of(locked, isController));
+    private void broadcastLockStatusToAll(AppInstance app) {
+        boolean locked = app.getControlLockService().isLocked();
+        for (String id : app.getBroadcastService().getClientIds()) {
+            boolean isController = app.getControlLockService().isController(id);
+            app.getBroadcastService().sendTo(id, LockStatusMessage.of(locked, isController));
         }
+    }
+
+    private String extractAppId(WebSocketSession session) {
+        URI uri = session.getUri();
+        if (uri == null) return "";
+        String path = uri.getPath();
+        int lastSlash = path.lastIndexOf('/');
+        return lastSlash >= 0 ? path.substring(lastSlash + 1) : path;
     }
 }

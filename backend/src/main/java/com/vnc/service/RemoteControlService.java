@@ -1,7 +1,6 @@
 package com.vnc.service;
 
 import com.vnc.swing.SwingApp;
-import org.springframework.stereotype.Service;
 
 import javax.imageio.IIOImage;
 import javax.imageio.ImageIO;
@@ -17,7 +16,6 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 
-@Service
 public class RemoteControlService {
 
     private static final int WIDTH = 1280;

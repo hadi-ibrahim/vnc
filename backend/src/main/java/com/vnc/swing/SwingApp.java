@@ -1,19 +1,18 @@
 package com.vnc.swing;
 
-import org.springframework.context.SmartLifecycle;
-import org.springframework.stereotype.Component;
-
 import javax.swing.*;
 import java.awt.*;
 import java.lang.reflect.InvocationTargetException;
 
-@Component
-public class SwingApp implements SmartLifecycle {
+public class SwingApp {
 
+    private final String title;
     private volatile JFrame frame;
-    private volatile boolean running;
 
-    @Override
+    public SwingApp(String title) {
+        this.title = title;
+    }
+
     public void start() {
         try {
             SwingUtilities.invokeAndWait(this::createAndShowGui);
@@ -23,11 +22,10 @@ public class SwingApp implements SmartLifecycle {
         } catch (InvocationTargetException e) {
             throw new RuntimeException("Failed to create Swing GUI", e.getCause());
         }
-        running = true;
     }
 
     private void createAndShowGui() {
-        frame = new JFrame("VNC Streaming Demo");
+        frame = new JFrame(title);
         frame.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         frame.setResizable(false);
         frame.setLayout(new BorderLayout());
@@ -90,7 +88,6 @@ public class SwingApp implements SmartLifecycle {
         return frame;
     }
 
-    @Override
     public void stop() {
         SwingUtilities.invokeLater(() -> {
             if (frame != null) {
@@ -98,16 +95,5 @@ public class SwingApp implements SmartLifecycle {
                 frame.dispose();
             }
         });
-        running = false;
-    }
-
-    @Override
-    public boolean isRunning() {
-        return running;
-    }
-
-    @Override
-    public int getPhase() {
-        return 0;
     }
 }

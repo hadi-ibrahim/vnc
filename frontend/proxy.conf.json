@@ -4,5 +4,10 @@
     "ws": true,
     "secure": false,
     "changeOrigin": true
+  },
+  "/api": {
+    "target": "https://localhost:8443",
+    "secure": false,
+    "changeOrigin": true
   }
 }

@@ -1,30 +1,20 @@
-import { Component, OnInit, OnDestroy } from '@angular/core';
-import { VncCanvasComponent } from './components/vnc-canvas/vnc-canvas.component';
-import { VncService } from './services/vnc.service';
+import { Component } from '@angular/core';
+import { RouterOutlet } from '@angular/router';
 
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [VncCanvasComponent],
-  templateUrl: './app.component.html',
-  styleUrl: './app.component.css',
+  imports: [RouterOutlet],
+  template: `<router-outlet />`,
+  styles: [
+    `
+      :host {
+        display: block;
+        min-height: 100vh;
+        background: #0a0a0f;
+        color: white;
+      }
+    `,
+  ],
 })
-export class AppComponent implements OnInit, OnDestroy {
-  constructor(public vnc: VncService) {}
-
-  ngOnInit(): void {
-    this.vnc.connect();
-  }
-
-  ngOnDestroy(): void {
-    this.vnc.disconnect();
-  }
-
-  toggleLock(): void {
-    if (this.vnc.isController()) {
-      this.vnc.releaseLock();
-    } else {
-      this.vnc.requestLock();
-    }
-  }
-}
+export class AppComponent {}
